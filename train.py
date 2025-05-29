@@ -32,11 +32,14 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
 
-from distributed import init_distributed
+from distributed import init_distributed, init_single_gpu
 from models import CDiT_models
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
+
+# W&B integration
+import wandb
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -67,24 +70,29 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if logging_dir is not None:
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
         )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler()]
+        )
+    logger = logging.getLogger(__name__)
     return logger
 
 #################################################################################
@@ -97,12 +105,18 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    _, rank, device, _ = init_distributed()
-    # rank = dist.get_rank()
-    seed = args.global_seed * dist.get_world_size() + rank
+    # Setup training mode (distributed or single GPU):
+    if args.single_gpu:
+        world_size, rank, device, is_distributed = init_single_gpu()
+        print(f"Starting single GPU training on device {device}")
+    else:
+        world_size, rank, device, is_distributed = init_distributed()
+        print(f"Starting distributed training: rank={rank}, world_size={world_size}")
+    
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
+    
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
@@ -110,6 +124,13 @@ def main(args):
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
+    
+    # Initialize W&B logging
+    wandb_run, run_id = init_wandb(args, config, rank, world_size, is_distributed)
+    
+    # Save run_id for worker nodes if we're the primary node
+    if is_distributed and rank == 0 and run_id:
+        save_run_id_for_workers(run_id, config)
     
     # Setup an experiment folder:
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -181,9 +202,22 @@ def main(args):
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
-    model = DDP(model, device_ids=[device])
+    
+    # Wrap model for distributed training if needed
+    if is_distributed:
+        model = DDP(model, device_ids=[device])
+    
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Log model info to W&B
+    if wandb_run and rank == 0:
+        wandb_run.log({
+            "model/parameters": sum(p.numel() for p in model.parameters()),
+            "model/trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "training/start_epoch": start_epoch,
+            "training/start_steps": train_steps,
+        })
 
     train_dataset = []
     test_dataset = []
@@ -235,17 +269,24 @@ def main(args):
     train_dataset = ConcatDataset(train_dataset)
     test_dataset = ConcatDataset(test_dataset)
 
-    sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
+    # Setup data loading with or without distributed sampling
+    if is_distributed:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+    
     loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
-        shuffle=False,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=config['num_workers'],
         pin_memory=True,
@@ -265,7 +306,8 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
+        if is_distributed and sampler is not None:
+            sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
         for x, y, rel_t in loader:
@@ -304,7 +346,7 @@ def main(args):
                 scaler.step(opt)
                 scaler.update()
             
-            update_ema(ema, model.module)
+            update_ema(ema, model.module if is_distributed else model)
 
             # Log loss values:
             running_loss += loss.detach().item()
@@ -315,12 +357,31 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = dist.get_world_size()*x_cond.shape[0]*steps_per_sec
+                samples_per_sec = world_size*x_cond.shape[0]*steps_per_sec
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                if is_distributed:
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / world_size
+                else:
+                    avg_loss = avg_loss.item()
+                
+                # Log to both logger and W&B
+                log_message = f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}"
+                logger.info(log_message)
+                
+                # Log metrics to W&B
+                if wandb_run:
+                    wandb_metrics = {
+                        "train/loss": avg_loss,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/samples_per_sec": samples_per_sec,
+                        "train/epoch": epoch,
+                        "train/learning_rate": opt.param_groups[0]['lr'],
+                        "system/gpu_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+                    }
+                    wandb_run.log(wandb_metrics, step=train_steps)
+                
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -330,7 +391,7 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": (model.module if is_distributed else model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
@@ -345,36 +406,90 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
                         torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    
+                    # Log checkpoint to W&B
+                    if wandb_run:
+                        # Save model artifact
+                        artifact = wandb.Artifact(
+                            name=f"model-checkpoint-{train_steps}",
+                            type="model",
+                            description=f"Model checkpoint at step {train_steps}"
+                        )
+                        artifact.add_file(checkpoint_path)
+                        wandb_run.log_artifact(artifact)
             
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
-                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
-                dist.barrier()
+                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, is_distributed, world_size)
+                if is_distributed:
+                    dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
                 logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
+                
+                # Log evaluation metrics to W&B
+                if wandb_run and rank == 0:
+                    eval_metrics = {
+                        "eval/perceptual_loss": sim_score.item() if torch.is_tensor(sim_score) else sim_score,
+                        "eval/eval_time": eval_time,
+                    }
+                    wandb_run.log(eval_metrics, step=train_steps)
+                    
+                    # Log evaluation images as W&B artifacts
+                    if os.path.exists(save_dir):
+                        eval_artifact = wandb.Artifact(
+                            name=f"eval-images-{train_steps}",
+                            type="evaluation",
+                            description=f"Evaluation images at step {train_steps}"
+                        )
+                        for img_file in glob(f"{save_dir}/*.png"):
+                            eval_artifact.add_file(img_file)
+                        if len(glob(f"{save_dir}/*.png")) > 0:
+                            wandb_run.log_artifact(eval_artifact)
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    
+    # Finish W&B run and cleanup
+    if wandb_run:
+        # Log final metrics
+        if rank == 0:
+            wandb_run.log({
+                "training/final_epoch": epoch,
+                "training/final_steps": train_steps,
+                "training/status": "completed"
+            })
+        wandb.finish()
+    
+    # Clean up run_id file if we're the primary node
+    if is_distributed and rank == 0:
+        cleanup_run_id_file(config)
+    
     cleanup()
 
 
 @torch.no_grad
-def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
-    sampler = DistributedSampler(
-        test_dataloaders,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=seed
-    )
+def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond, is_distributed, world_size):
+    if is_distributed:
+        sampler = DistributedSampler(
+            test_dataloaders,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+    
     loader = DataLoader(
         test_dataloaders,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
@@ -414,8 +529,9 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
             plt.savefig(f'{save_dir}/{i}.png')
             plt.close()
 
-    dist.all_reduce(score)
-    dist.all_reduce(n_samples)
+    if is_distributed:
+        dist.all_reduce(score)
+        dist.all_reduce(n_samples)
     sim_score = score/n_samples
     return sim_score
 
@@ -430,7 +546,129 @@ def get_args_parser():
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
+    parser.add_argument("--single-gpu", type=int, default=1)
+    
+    # W&B arguments
+    parser.add_argument("--wandb-project", type=str, default="nwm", help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=[], help="W&B tags for the run")
+    parser.add_argument("--wandb-disabled", action="store_true", help="Disable W&B logging")
+    
     return parser
+
+def init_wandb(args, config, rank, world_size, is_distributed):
+    """
+    Initialize Weights & Biases logging following industry best practices.
+    
+    For single GPU: Standard wandb.init()
+    For distributed: Use shared mode with primary/worker node distinction
+    """
+    # Check if W&B is disabled
+    if args.wandb_disabled:
+        print("W&B logging disabled via --wandb-disabled flag")
+        return None, None
+    
+    # Enable wandb service for better reliability in distributed settings
+    if hasattr(wandb, 'require'):
+        wandb.require("service")
+    
+    # Prepare wandb config by merging args and config
+    # Override config values with command line arguments if provided
+    wandb_config = {
+        **config,      # Configuration from YAML files
+        **vars(args),  # Command line arguments (these take precedence)
+    }
+    
+    # Use command line arguments for W&B settings, fallback to config file
+    project = args.wandb_project or config.get('wandb_project', 'nwm-training')
+    entity = args.wandb_entity or config.get('wandb_entity', None)
+    tags = args.wandb_tags + config.get('wandb_tags', [])
+    
+    if is_distributed:
+        # Distributed training: Use shared mode
+        run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_distributed"
+        
+        if rank == 0:
+            # Primary node
+            run = wandb.init(
+                project=project,
+                entity=entity,
+                name=run_name,
+                config=wandb_config,
+                settings=wandb.Settings(
+                    mode="shared",
+                    x_primary=True,
+                    x_label=f"rank_{rank}",
+                    x_stats_gpu_device_ids=list(range(torch.cuda.device_count())),
+                ),
+                tags=["distributed", "training"] + tags,
+                notes=f"Distributed training with {world_size} processes",
+            )
+            print(f"W&B initialized on primary node (rank {rank}) with run ID: {run.id}")
+            return run, run.id
+        else:
+            # Worker nodes need the run_id from primary node
+            # In practice, you'd share this via environment variable or file
+            # For now, we'll create a temporary approach
+            import time
+            import os
+            
+            # Wait for primary node to create run_id file
+            run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+            max_wait = 60  # seconds
+            waited = 0
+            
+            while not os.path.exists(run_id_file) and waited < max_wait:
+                time.sleep(1)
+                waited += 1
+            
+            if os.path.exists(run_id_file):
+                with open(run_id_file, 'r') as f:
+                    run_id = f.read().strip()
+                
+                run = wandb.init(
+                    project=project,
+                    entity=entity,
+                    id=run_id,
+                    settings=wandb.Settings(
+                        mode="shared",
+                        x_primary=False,
+                        x_label=f"rank_{rank}",
+                        x_update_finish_state=False,
+                    ),
+                )
+                print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
+                return run, run_id
+            else:
+                print(f"Warning: Could not get run_id from primary node (rank {rank})")
+                return None, None
+    else:
+        # Single GPU training: Standard initialization
+        run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_single_gpu"
+        
+        run = wandb.init(
+            project=project,
+            entity=entity,
+            name=run_name,
+            config=wandb_config,
+            tags=["single-gpu", "training"] + tags,
+            notes="Single GPU training",
+        )
+        print(f"W&B initialized for single GPU training with run ID: {run.id}")
+        return run, run.id
+
+def save_run_id_for_workers(run_id, config):
+    """Save run_id to a file for worker nodes to access"""
+    run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+    with open(run_id_file, 'w') as f:
+        f.write(run_id)
+
+def cleanup_run_id_file(config):
+    """Clean up the run_id file"""
+    run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+    if os.path.exists(run_id_file):
+        os.remove(run_id_file)
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()

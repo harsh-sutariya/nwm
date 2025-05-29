@@ -1,5 +1,8 @@
 run_name: nwm_cdit_xl
 
+wandb_project: "nwm"
+wandb_run_name: null 
+
 # training setup
 results_dir: logs
 train: True
@@ -25,22 +28,22 @@ len_traj_pred: 64
 image_size: 224
 datasets:
   recon:
-    data_folder: data/recon
+    data_folder: /vast/hs5580/data/nwm/recon
     train: data_splits/recon/train/ # path to train folder with traj_names.txt
     test: data_splits/recon/test/ # path to test folder with traj_names.txt
     goals_per_obs: 4
-  tartan_drive:
-    data_folder: data/tartan
-    train: data_splits/tartan_drive/train/
-    test: data_splits/tartan_drive/test/
-    goals_per_obs: 4
-  sacson:
-    data_folder: data/sacson
-    train: data_splits/sacson/train
-    test: data_splits/sacson/test
-    goals_per_obs: 4
-  scand:
-    data_folder: data/scand
-    train: data_splits/scand/train
-    test: data_splits/scand/test
-    goals_per_obs: 4
+  # tartan_drive:
+  #   data_folder: data/tartan
+  #   train: data_splits/tartan_drive/train/
+  #   test: data_splits/tartan_drive/test/
+  #   goals_per_obs: 4
+  # sacson:
+  #   data_folder: data/sacson
+  #   train: data_splits/sacson/train
+  #   test: data_splits/sacson/test
+  #   goals_per_obs: 4
+  # scand:
+  #   data_folder: data/scand
+  #   train: data_splits/scand/train
+  #   test: data_splits/scand/test
+  #   goals_per_obs: 4
