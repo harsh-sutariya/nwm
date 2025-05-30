@@ -408,8 +408,8 @@ def main(args):
                         torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                     
-                    # Log checkpoint to W&B
-                    if wandb_run:
+                    # Log checkpoint to W&B (only if explicitly enabled)
+                    if wandb_run and args.wandb_save_checkpoints:
                         # Save model artifact
                         artifact = wandb.Artifact(
                             name=f"model-checkpoint-{train_steps}",
@@ -418,6 +418,9 @@ def main(args):
                         )
                         artifact.add_file(checkpoint_path)
                         wandb_run.log_artifact(artifact)
+                        logger.info(f"Uploaded checkpoint to W&B: model-checkpoint-{train_steps}")
+                    elif wandb_run:
+                        logger.info(f"Checkpoint saved locally only (W&B checkpoint saving disabled)")
             
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
@@ -437,8 +440,8 @@ def main(args):
                     }
                     wandb_run.log(eval_metrics, step=train_steps)
                     
-                    # Log evaluation images as W&B artifacts
-                    if os.path.exists(save_dir):
+                    # Log evaluation images as W&B artifacts (only if explicitly enabled)
+                    if args.wandb_save_eval_images and os.path.exists(save_dir):
                         eval_artifact = wandb.Artifact(
                             name=f"eval-images-{train_steps}",
                             type="evaluation",
@@ -448,6 +451,9 @@ def main(args):
                             eval_artifact.add_file(img_file)
                         if len(glob(f"{save_dir}/*.png")) > 0:
                             wandb_run.log_artifact(eval_artifact)
+                            logger.info(f"Uploaded evaluation images to W&B: eval-images-{train_steps}")
+                    elif os.path.exists(save_dir):
+                        logger.info(f"Evaluation images saved locally only (W&B image artifact saving disabled)")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -572,6 +578,8 @@ def get_args_parser():
     parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
     parser.add_argument("--wandb-tags", type=str, nargs="*", default=[], help="W&B tags for the run")
     parser.add_argument("--wandb-disabled", action="store_true", help="Disable W&B logging")
+    parser.add_argument("--wandb-save-checkpoints", action="store_true", help="Save model checkpoints to W&B as artifacts")
+    parser.add_argument("--wandb-save-eval-images", action="store_true", help="Save evaluation images to W&B as artifacts")
     
     return parser
 
