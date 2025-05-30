@@ -24,6 +24,7 @@ import logging
 import os
 import matplotlib.pyplot as plt 
 import yaml
+from glob import glob
 
 
 import torch.distributed as dist
@@ -495,8 +496,25 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
         pin_memory=True,
         drop_last=True
     )
-    from dreamsim import dreamsim
-    eval_model, _ = dreamsim(pretrained=True)
+    
+    # Initialize DreamSim model with distributed-safe loading
+    if is_distributed:
+        # Only rank 0 downloads the model to avoid race conditions
+        if rank == 0:
+            from dreamsim import dreamsim
+            eval_model, _ = dreamsim(pretrained=True)
+        
+        # Wait for rank 0 to finish downloading
+        dist.barrier()
+        
+        # Now all ranks can safely load the model
+        if rank != 0:
+            from dreamsim import dreamsim
+            eval_model, _ = dreamsim(pretrained=True)
+    else:
+        from dreamsim import dreamsim
+        eval_model, _ = dreamsim(pretrained=True)
+    
     score = torch.tensor(0.).to(device)
     n_samples = torch.tensor(0).to(device)
 
