@@ -172,7 +172,7 @@ def main(args):
             raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
         print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+        latest_checkpoint = torch.load(latest_path, map_location=f'cuda:{device}', weights_only=False) 
 
         if "model" in latest_checkpoint:
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
