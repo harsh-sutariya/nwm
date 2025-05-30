@@ -1,0 +1,37 @@
+run_name: nwm_cdit_xl_memory
+
+# training setup
+results_dir: logs
+train: True
+batch_size: 12  # Reduced batch size due to memory overhead
+num_workers: 12
+model: CDiT-XL/2
+lr: 8e-5
+
+# Memory-specific parameters
+enable_memory: True
+memory_size: 512
+memory_layers: [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]  # Later layers only
+max_temporal_distance: 100
+
+# normalization for the action space
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+
+# distance bounds for distance and action and distance predictions 
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# action output params
+len_traj_pred: 64
+
+# dataset specific parameters
+image_size: 224
+datasets:
+  recon:
+    data_folder: /vast/hs5580/data/nwm/recon
+    train: data_splits/recon/train/ # path to train folder with traj_names.txt
+    test: data_splits/recon/test/ # path to test folder with traj_names.txt
+    goals_per_obs: 4

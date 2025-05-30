@@ -26,7 +26,6 @@ import matplotlib.pyplot as plt
 import yaml
 from glob import glob
 
-
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, ConcatDataset
@@ -150,7 +149,24 @@ def main(args):
 
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
-    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
+    
+    # Prepare model parameters with optional memory support
+    model_kwargs = {
+        'context_size': num_cond, 
+        'input_size': latent_size, 
+        'in_channels': 4
+    }
+    
+    # Add memory parameters if enabled in config
+    if config.get('enable_memory', False):
+        model_kwargs.update({
+            'enable_memory': True,
+            'memory_size': config.get('memory_size', 512),
+            'memory_layers': config.get('memory_layers', None)
+        })
+        logger.info(f"Memory enabled with size {config.get('memory_size', 512)} and layers {config.get('memory_layers', 'auto')}")
+    
+    model = CDiT_models[config['model']](**model_kwargs).to(device)
     
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -331,7 +347,28 @@ def main(args):
                 rel_t = rel_t.flatten(0, 1)
                 
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
+                
+                # Prepare model kwargs with optional memory support
                 model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+                
+                # Add memory-related parameters if enabled
+                if config.get('enable_memory', False):
+                    # Generate fake timestamps for training (use training step as proxy)
+                    # In real deployment, this would come from actual frame timestamps
+                    batch_timestamps = torch.arange(train_steps, train_steps + x_start.shape[0], device=device)
+                    model_kwargs.update({
+                        'timestamp': batch_timestamps,
+                        'store_in_memory': True  # Store frames in memory during training
+                    })
+                    
+                    # Periodically clear memory to prevent overfitting to long sequences
+                    if train_steps % 1000 == 0 and hasattr(model, 'clear_memory'):
+                        if is_distributed:
+                            model.module.clear_memory()
+                        else:
+                            model.clear_memory()
+                        logger.info(f"Cleared memory bank at step {train_steps}")
+                
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
 

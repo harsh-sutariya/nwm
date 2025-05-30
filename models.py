@@ -13,6 +13,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from memory import FIFOMemoryBank, MemoryAugmentedAttention
 
 
 def modulate(x, shift, scale):
@@ -82,31 +83,68 @@ class ActionEmbedder(nn.Module):
 
 class CDiTBlock(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning and memory-augmented attention.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, enable_memory=False, **block_kwargs):
         super().__init__()
+        self.enable_memory = enable_memory
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm_cond = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.cttn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, add_bias_kv=True, bias=True, batch_first=True, **block_kwargs)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 11 * hidden_size, bias=True)
-        )
+        
+        # Use memory-augmented attention if enabled, otherwise use standard cross-attention
+        if enable_memory:
+            self.cttn = MemoryAugmentedAttention(hidden_size, num_heads=num_heads, **block_kwargs)
+            # Extended modulation for memory attention
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 14 * hidden_size, bias=True)  # Extended from 11 to 14 for memory
+            )
+        else:
+            self.cttn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, add_bias_kv=True, bias=True, batch_first=True, **block_kwargs)
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 11 * hidden_size, bias=True)
+            )
 
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, c, x_cond):
-        shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(11, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
-        x = x + gate_ca_x.unsqueeze(1) * self.cttn(query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), key=x_cond_norm, value=x_cond_norm, need_weights=False)[0]
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+    def forward(self, x, c, x_cond, memory_key=None, memory_value=None):
+        if self.enable_memory:
+            # Extended modulation for memory-augmented attention
+            modulation_chunks = self.adaLN_modulation(c).chunk(14, dim=1)
+            shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mem, scale_mem, gate_mem, shift_mlp, scale_mlp, gate_mlp = modulation_chunks
+            
+            # Self-attention
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            
+            # Memory-augmented cross-attention
+            x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
+            x_query = modulate(self.norm2(x), shift_ca_x, scale_ca_x)
+            
+            # Apply memory-augmented attention
+            memory_out = self.cttn(
+                query=x_query,
+                context_key=x_cond_norm,
+                context_value=x_cond_norm,
+                memory_key=memory_key,
+                memory_value=memory_value
+            )
+            x = x + gate_ca_x.unsqueeze(1) * memory_out
+            
+            # MLP
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+        else:
+            # Original CDiT block behavior
+            shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(11, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
+            x = x + gate_ca_x.unsqueeze(1) * self.cttn(query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), key=x_cond_norm, value=x_cond_norm, need_weights=False)[0]
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
 
 class FinalLayer(nn.Module):
@@ -131,7 +169,7 @@ class FinalLayer(nn.Module):
 
 class CDiT(nn.Module):
     """
-    Diffusion model with a Transformer backbone.
+    Diffusion model with a Transformer backbone and optional memory bank for temporal context.
     """
     def __init__(
         self,
@@ -144,6 +182,9 @@ class CDiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         learn_sigma=True,
+        enable_memory=False,
+        memory_size=512,
+        memory_layers=None,  # Which layers to enable memory for (None = all layers)
     ):
         super().__init__()
         self.context_size = context_size
@@ -152,12 +193,39 @@ class CDiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.enable_memory = enable_memory
+        
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ActionEmbedder(hidden_size)
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
-        self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+        
+        # Initialize memory bank if enabled
+        if enable_memory:
+            self.memory_bank = FIFOMemoryBank(
+                hidden_size=hidden_size,
+                max_memory_size=memory_size,
+                patch_size=int(math.sqrt(num_patches))
+            )
+            # Determine which layers use memory
+            if memory_layers is None:
+                memory_layers = list(range(depth // 2, depth))  # Use memory in later layers only
+            self.memory_layers = set(memory_layers)
+        else:
+            self.memory_bank = None
+            self.memory_layers = set()
+        
+        # Create transformer blocks with memory support
+        self.blocks = nn.ModuleList([
+            CDiTBlock(
+                hidden_size, 
+                num_heads, 
+                mlp_ratio=mlp_ratio,
+                enable_memory=(i in self.memory_layers and enable_memory)
+            ) for i in range(depth)
+        ])
+        
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.time_embedder = TimestepEmbedder(hidden_size)
         self.initialize_weights()
@@ -178,7 +246,6 @@ class CDiT(nn.Module):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
-
 
         # Initialize action embedding:
         nn.init.normal_(self.y_embedder.x_emb.mlp[0].weight, std=0.02)
@@ -208,6 +275,22 @@ class CDiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def add_to_memory(self, x_encoded, timestamp):
+        """Add encoded frame to memory bank."""
+        if self.memory_bank is not None:
+            self.memory_bank.add_memory(x_encoded, timestamp)
+    
+    def get_memory_context(self, timestamp, max_context=32):
+        """Get memory context for current timestamp."""
+        if self.memory_bank is not None:
+            return self.memory_bank.get_memory_context(timestamp, max_context)
+        return None, None
+    
+    def clear_memory(self):
+        """Clear memory bank."""
+        if self.memory_bank is not None:
+            self.memory_bank.clear_memory()
+
     def unpatchify(self, x):
         """
         x: (N, T, patch_size**2 * C)
@@ -223,23 +306,46 @@ class CDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, x_cond, rel_t):
+    def forward(self, x, t, y, x_cond, rel_t, timestamp=None, store_in_memory=False):
         """
-        Forward pass of DiT.
+        Forward pass of DiT with optional memory integration.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        timestamp: Current frame timestamp for memory operations
+        store_in_memory: Whether to store current frame in memory after processing
         """
+        # Encode input and context
         x = self.x_embedder(x) + self.pos_embed[self.context_size:]
-        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
+        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]
         x_cond = x_cond.flatten(1, 2)
+        
+        # Embeddings
         t = self.t_embedder(t[..., None])
         y = self.y_embedder(y) 
         time_emb = self.time_embedder(rel_t[..., None])
-        c = t + time_emb + y # if training on unlabeled data, dont add y.
+        c = t + time_emb + y
 
-        for block in self.blocks:
-            x = block(x, c, x_cond)
+        # Get memory context if available
+        memory_key, memory_value = None, None
+        if self.enable_memory and timestamp is not None:
+            memory_key, memory_value = self.get_memory_context(timestamp)
+            # Add temporal positional encoding to memory
+            if memory_key is not None:
+                memory_key = memory_key + memory_value  # memory_value contains temporal pos encoding
+                memory_value = memory_key  # Use same for key and value
+
+        # Forward through transformer blocks
+        for i, block in enumerate(self.blocks):
+            if i in self.memory_layers and self.enable_memory:
+                x = block(x, c, x_cond, memory_key, memory_value)
+            else:
+                x = block(x, c, x_cond)
+        
+        # Store current frame in memory if requested
+        if store_in_memory and self.enable_memory and timestamp is not None:
+            self.add_to_memory(x.detach(), timestamp)
+        
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x
