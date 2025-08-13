@@ -22,7 +22,7 @@ To download and preprocess data, please follow the steps from [NoMaD](https://gi
 - Change the [preprocessing resolution](https://github.com/robodhruv/visualnav-transformer/blob/main/train/vint_train/data/data_utils.py#L13) from (160, 120) to (320, 240) for higher resolution 
 - run `process_bags.py` and `process_recon.py` to save each processed dataset to `path/to/nwm_repo/data/<dataset_name>`.
 
-For [SACSon/HuRoN](https://sites.google.com/view/sacson-review/huron-dataset), we used a private version which contains higher resolution images. Please contact the authors for access.
+For [SACSon/HuRoN](https://sites.google.com/view/sacson-review/huron-dataset), we used a private version which contains higher resolution images. Please contact the dataset authors for access (we're unable to distribute).
 
 Finally, you should have the following structure:
 
