@@ -1,0 +1,3 @@
+[submodule "teacher/VideoMAEv2"]
+	path = teacher/VideoMAEv2
+	url = git@github.com:harsh-sutariya/VideoMAEv2.git
