@@ -1,18 +1,19 @@
-run_name: nwm_cdit_sl
+run_name: ac_repa_cdit_sl
 
 wandb_project: "nwm"
 wandb_run_name: null 
 
+# Resume behavior: set to true to allow resuming from checkpoints and wandb runs
+# Default: false (always start fresh training)
+# allow_resume: false
+
+# training setup
 results_dir: logs
 train: True
 batch_size: 16
 num_workers: 12
 model: CDiT-S/2
 lr: 8e-5
-
-# Resume behavior: set to true to allow resuming from checkpoints and wandb runs
-# Default: false (always start fresh training)
-# allow_resume: false
 
 # normalization for the action space
 normalize: True
@@ -26,6 +27,19 @@ distance:
 
 # action output params
 len_traj_pred: 64
+
+# AC-REPA training objective parameters
+use_ac_repa: True
+ac_repa:
+  teacher_model: 'MCG-NJU/videomae-base-finetuned-kinetics' 
+  teacher_dim: 768   # VideoMAE base hidden dimension
+  proj_dim: 512
+  fa_pool_type: 'mean'
+  trd_gate_type: 'action'
+  lambda_fa: 0.1     # Feature Alignment weight
+  lambda_trd: 0.05   # Temporal Relation Distillation weight
+  use_sparse_trd: True
+  sparse_ratio: 0.25
 
 # dataset specific parameters
 image_size: 224

@@ -24,6 +24,7 @@ import logging
 import os
 import matplotlib.pyplot as plt 
 import yaml
+from glob import glob
 
 
 import torch.distributed as dist
@@ -32,11 +33,17 @@ from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
 
-from distributed import init_distributed
-from models import CDiT_models
+from distributed import init_distributed, init_single_gpu
+from models import CDiT_models, ACRepaLoss
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
+
+# Teacher model for AC-REPA
+from transformers import AutoModel, AutoImageProcessor
+
+# W&B integration
+import wandb
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -67,24 +74,29 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if logging_dir is not None:
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
         )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler()]
+        )
+    logger = logging.getLogger(__name__)
     return logger
 
 #################################################################################
@@ -97,12 +109,18 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    _, rank, device, _ = init_distributed()
-    # rank = dist.get_rank()
-    seed = args.global_seed * dist.get_world_size() + rank
+    # Setup training mode (distributed or single GPU):
+    if args.single_gpu:
+        world_size, rank, device, is_distributed = init_single_gpu()
+        print(f"Starting single GPU training on device {device}")
+    else:
+        world_size, rank, device, is_distributed = init_distributed()
+        print(f"Starting distributed training: rank={rank}, world_size={world_size}")
+    
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
+    
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
@@ -110,6 +128,13 @@ def main(args):
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
+    
+    # Initialize W&B logging
+    wandb_run, run_id = init_wandb(args, config, rank, world_size, is_distributed)
+    
+    # Save run_id for worker nodes if we're the primary node
+    if is_distributed and rank == 0 and run_id:
+        save_run_id_for_workers(run_id, config)
     
     # Setup an experiment folder:
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -133,6 +158,48 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     
+    # Initialize teacher model and AC-REPA loss if enabled
+    teacher_model = None
+    teacher_processor = None
+    ac_repa_loss_fn = None
+    
+    if config.get('use_ac_repa', False):
+        logger.info("Initializing AC-REPA training objective...")
+        ac_repa_config = config.get('ac_repa', {})
+        
+        # Load teacher model
+        teacher_model_name = ac_repa_config.get('teacher_model', 'MCG-NJU/videomae-base-finetuned-kinetics')
+        logger.info(f"Loading teacher model: {teacher_model_name}")
+        teacher_model = AutoModel.from_pretrained(teacher_model_name).to(device)
+        teacher_processor = AutoImageProcessor.from_pretrained(teacher_model_name)
+        teacher_model.eval()
+        requires_grad(teacher_model, False)
+        
+        # Initialize AC-REPA loss with dynamic student dimension
+        # Automatically infer student_dim from the chosen CDiT model
+        actual_student_dim = model.module.blocks[0].norm1.normalized_shape[0] if is_distributed else model.blocks[0].norm1.normalized_shape[0]
+        num_layers = len(model.module.blocks) if is_distributed else len(model.blocks)
+        target_extraction_layer = max(0, int(num_layers * 0.67) - 1) + 1  # +1 for human-readable (1-indexed)
+        logger.info(f"Auto-detected student model: {num_layers} layers, hidden_dim={actual_student_dim}, extracting from layer {target_extraction_layer}")
+        
+        # Override config student_dim with actual model dimension for robustness
+        if 'student_dim' in ac_repa_config and ac_repa_config['student_dim'] != actual_student_dim:
+            logger.warning(f"Config student_dim ({ac_repa_config['student_dim']}) doesn't match model dimension ({actual_student_dim}). Using model dimension.")
+        
+        ac_repa_loss_fn = ACRepaLoss(
+            student_dim=actual_student_dim,  # Use actual model dimension
+            teacher_dim=ac_repa_config.get('teacher_dim', 768),
+            proj_dim=ac_repa_config.get('proj_dim', 512),
+            fa_pool_type=ac_repa_config.get('fa_pool_type', 'mean'),
+            trd_gate_type=ac_repa_config.get('trd_gate_type', 'temporal'),
+            lambda_fa=ac_repa_config.get('lambda_fa', 1.0),
+            lambda_trd=ac_repa_config.get('lambda_trd', 1.0),
+            use_sparse_trd=ac_repa_config.get('use_sparse_trd', True),
+            sparse_ratio=ac_repa_config.get('sparse_ratio', 0.25)
+        ).to(device)
+        
+        logger.info(f"AC-REPA loss initialized with lambda_fa={ac_repa_config.get('lambda_fa', 1.0)}, lambda_trd={ac_repa_config.get('lambda_trd', 1.0)}")
+    
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
@@ -141,49 +208,78 @@ def main(args):
     if bfloat_enable:
         scaler = torch.amp.GradScaler()
 
-    # load existing checkpoint
+    # Checkpoint loading logic - controlled by command line arguments
     latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
-    print('Searching for model from ', checkpoint_dir)
     start_epoch = 0
     train_steps = 0
-    if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
-        if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
-            raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
-        latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
-        print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+    
+    # Check if resuming is allowed (from config)
+    allow_resume = config.get('allow_resume', False)  # Default: False (always start fresh)
+    if allow_resume:
+        print('Resume is ENABLED - will attempt to load from checkpoints')
+        if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
+            if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
+                raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
+            latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
+            print("Loading model from ", latest_path)
+            latest_checkpoint = torch.load(latest_path, map_location=f'cuda:{device}', weights_only=False) 
 
-        if "model" in latest_checkpoint:
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
-            res = model.load_state_dict(model_ckp, strict=True)
-            print("Loading model weights", res)
+            if "model" in latest_checkpoint:
+                model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
+                res = model.load_state_dict(model_ckp, strict=True)
+                print("Loading model weights", res)
 
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
-            res = ema.load_state_dict(model_ckp, strict=True)
-            print("Loading EMA model weights", res)
+                model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
+                res = ema.load_state_dict(model_ckp, strict=True)
+                print("Loading EMA model weights", res)
+            else:
+                update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+
+            if "opt" in latest_checkpoint:
+                opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
+                opt.load_state_dict(opt_ckp)
+                print("Loading optimizer params")
+            
+            if "epoch" in latest_checkpoint:
+                start_epoch = latest_checkpoint['epoch'] + 1
+            
+            if "train_steps" in latest_checkpoint:
+                train_steps = latest_checkpoint["train_steps"]
+            
+            if "scaler" in latest_checkpoint:
+                scaler.load_state_dict(latest_checkpoint["scaler"])
         else:
+            print('No checkpoint found - starting fresh')
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-
-        if "opt" in latest_checkpoint:
-            opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
-            opt.load_state_dict(opt_ckp)
-            print("Loading optimizer params")
+    else:
+        # Fresh start mode (default behavior)
+        print('FRESH START MODE - checkpoint resuming is DISABLED')
+        print('Existing checkpoints in', checkpoint_dir, 'will be ignored')
+        if os.path.isfile(latest_path):
+            print(f'Found existing checkpoint {latest_path} but ignoring due to fresh start mode')
         
-        if "epoch" in latest_checkpoint:
-            start_epoch = latest_checkpoint['epoch'] + 1
-        
-        if "train_steps" in latest_checkpoint:
-            train_steps = latest_checkpoint["train_steps"]
-        
-        if "scaler" in latest_checkpoint:
-            scaler.load_state_dict(latest_checkpoint["scaler"])
+        # Always initialize EMA with synced weights for fresh training
+        update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
         
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
-    model = DDP(model, device_ids=[device])
+    
+    # Wrap model for distributed training if needed
+    if is_distributed:
+        model = DDP(model, device_ids=[device])
+    
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Log model info to W&B
+    if wandb_run and rank == 0:
+        wandb_run.log({
+            "model/parameters": sum(p.numel() for p in model.parameters()),
+            "model/trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "training/start_epoch": start_epoch,
+            "training/start_steps": train_steps,
+        })
 
     train_dataset = []
     test_dataset = []
@@ -235,17 +331,24 @@ def main(args):
     train_dataset = ConcatDataset(train_dataset)
     test_dataset = ConcatDataset(test_dataset)
 
-    sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
+    # Setup data loading with or without distributed sampling
+    if is_distributed:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+    
     loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
-        shuffle=False,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=config['num_workers'],
         pin_memory=True,
@@ -261,11 +364,17 @@ def main(args):
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
+    running_diffusion_loss = 0
+    running_fa_loss = 0
+    running_trd_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
+    epoch = start_epoch  
+    logged_batch_shapes = False
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
+        if is_distributed and sampler is not None:
+            sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
         for x, y, rel_t in loader:
@@ -274,6 +383,98 @@ def main(args):
             rel_t = rel_t.to(device, non_blocking=True)
             
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
+                # Extract teacher features from original pixels (before VAE encoding) if using AC-REPA
+                teacher_features = None
+                if config.get('use_ac_repa', False) and teacher_model is not None:
+                    with torch.no_grad():
+                        # x is [B, T, C, H, W] in range [-1, 1]
+                        # Only process goal frames to match student processing
+                        B, T, C, H, W = x.shape
+                        num_goals = T - num_cond
+                        x_goals = x[:, num_cond:]  # [B, num_goals, C, H, W] - only goal frames
+                        
+                        # VideoMAE expects exactly 16 frames
+                        videomae_frames = 16
+                        
+                        # Batched teacher processing for memory efficiency
+                        # Convert entire batch from [-1, 1] to [0, 1] for VideoMAE
+                        x_normalized = x_goals * 0.5 + 0.5  # [B, num_goals, C, H, W]
+                        
+                        # Determine teacher sampling indices once to preserve temporal ordering
+                        if num_goals == videomae_frames:
+                            sample_indices = torch.arange(videomae_frames, device=x_normalized.device)
+                        else:
+                            base_positions = torch.linspace(0, max(num_goals - 1, 1), steps=videomae_frames, device=x_normalized.device)
+                            sample_indices = torch.clamp(base_positions.round().long(), 0, num_goals - 1)
+
+                        x_sampled = x_normalized[:, sample_indices]  # [B, 16, C, H, W]
+
+                        # Fully batched teacher processing
+                        batch_frames_list = [[x_sampled[b, t] for t in range(videomae_frames)] for b in range(B)]
+
+                        batch_inputs = teacher_processor(batch_frames_list, return_tensors="pt", do_rescale=False)
+                        batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
+
+                        batch_outputs = teacher_model(**batch_inputs, output_hidden_states=True)
+                        batch_teacher_features = batch_outputs.hidden_states[-1][:, 1:, :]  # [B, frames*patches, D]
+                        D = batch_teacher_features.shape[-1]
+
+                        total_tokens = batch_teacher_features.shape[1]
+
+                        teacher_cfg = getattr(teacher_model, "config", None)
+                        teacher_image_size = getattr(teacher_cfg, "image_size", config["image_size"]) if teacher_cfg else config["image_size"]
+                        teacher_patch_size = getattr(teacher_cfg, "patch_size", 16) if teacher_cfg else 16
+                        if isinstance(teacher_image_size, (tuple, list)):
+                            teacher_image_size = teacher_image_size[0]
+                        if isinstance(teacher_patch_size, (tuple, list)):
+                            teacher_patch_size = teacher_patch_size[-1]
+                        spatial_tokens = max(1, (teacher_image_size // teacher_patch_size) ** 2)
+
+                        teacher_frames = max(1, round(total_tokens / spatial_tokens))
+                        expected_tokens = teacher_frames * spatial_tokens
+
+                        if expected_tokens != total_tokens:
+                            if expected_tokens > total_tokens:
+                                pad = expected_tokens - total_tokens
+                                pad_tokens = batch_teacher_features[:, -1:, :].expand(-1, pad, -1)
+                                batch_teacher_features = torch.cat([batch_teacher_features, pad_tokens], dim=1)
+                            else:
+                                batch_teacher_features = batch_teacher_features[:, :expected_tokens, :]
+
+                        teacher_tokens = batch_teacher_features.view(B, teacher_frames, spatial_tokens, D)
+
+                        teacher_positions = torch.linspace(
+                            0, max(num_goals - 1, 0), steps=teacher_frames, device=teacher_tokens.device
+                        ) if teacher_frames > 1 else torch.zeros(1, device=teacher_tokens.device)
+
+                        if num_goals == 1:
+                            teacher_features = teacher_tokens[:, :1]
+                        elif teacher_frames == num_goals:
+                            teacher_features = teacher_tokens
+                        else:
+                            target_positions = torch.arange(num_goals, device=teacher_tokens.device, dtype=teacher_positions.dtype)
+                            right_idx = torch.searchsorted(teacher_positions, target_positions, right=False)
+                            right_idx = torch.clamp(right_idx, max=teacher_frames - 1)
+                            left_idx = torch.clamp(right_idx - 1, min=0)
+
+                            left_pos = teacher_positions[left_idx]
+                            right_pos = teacher_positions[right_idx]
+                            denom = (right_pos - left_pos).clamp(min=1e-6)
+                            alpha = (target_positions - left_pos) / denom
+                            alpha = alpha.view(1, num_goals, 1, 1)
+
+                            teacher_lower = teacher_tokens.index_select(1, left_idx)
+                            teacher_upper = teacher_tokens.index_select(1, right_idx)
+
+                            lerp_alpha = alpha.to(dtype=teacher_lower.dtype)
+                            teacher_features = torch.lerp(teacher_lower, teacher_upper, lerp_alpha)
+
+                            same_mask = (right_pos == left_pos).view(1, num_goals, 1, 1)
+                            if same_mask.any():
+                                teacher_features = torch.where(same_mask, teacher_lower, teacher_features)
+
+                        teacher_features = teacher_features.to(dtype=torch.float32).contiguous()
+                
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     B, T = x.shape[:2]
@@ -284,15 +485,82 @@ def main(args):
                 num_goals = T - num_cond
                 x_start = x[:, num_cond:].flatten(0, 1)
                 x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+                y_actions = y.clone()  # Keep original actions for AC-REPA
+                goal_actions = y_actions[:, :num_goals]
+
+                if not logged_batch_shapes and rank == 0:
+                    logger.info(
+                        f"Initial batch: x_shape={tuple(x.shape)}, y_shape={tuple(y.shape)}, "
+                        f"num_goals={num_goals}, goal_action_shape={tuple(goal_actions.shape)}"
+                    )
+                    logged_batch_shapes = True
+
+                if goal_actions.shape[1] != num_goals:
+                    logger.error(
+                        f"Mismatch between num_goals ({num_goals}) and goal action length {goal_actions.shape[1]}"
+                    )
+
+                if num_goals <= 0 or goal_actions.shape[1] == 0:
+                    logger.error(
+                        f"AC-REPA received empty goal slice: num_goals={num_goals}, goal_action_shape={tuple(goal_actions.shape)}"
+                    )
+
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
                 
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
-                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
-                loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
-                loss = loss_dict["loss"].mean()
+                
+                # If using AC-REPA, we need to extract student features
+                if config.get('use_ac_repa', False) and ac_repa_loss_fn is not None:
+                    # Use a custom diffusion training loss that extracts features
+                    # We'll do a single forward pass and extract both diffusion loss and features
+                    with torch.no_grad():
+                        # Get a sample from the diffusion process for feature extraction
+                        noise = torch.randn_like(x_start)
+                        x_noisy = diffusion.q_sample(x_start, t, noise=noise)
+                    
+                    # Single forward pass with feature extraction
+                    model_output, student_features = (model.module if is_distributed else model)(
+                        x_noisy, t, y, x_cond, rel_t, return_features=True
+                    )
+                    
+                    # Compute diffusion loss manually from model output
+                    # When learn_sigma=True, model outputs [noise_pred, var_pred] with 2*C channels
+                    # Extract only the noise prediction (first C channels)
+                    if model_output.shape[1] == 2 * x_start.shape[1]:
+                        # Model outputs both noise and variance - take only noise prediction
+                        noise_pred = model_output[:, :x_start.shape[1]]
+                    else:
+                        # Model outputs only noise prediction
+                        noise_pred = model_output
+                    
+                    target = noise  # Use noise as target since model predicts epsilon
+                    diffusion_loss = torch.nn.functional.mse_loss(noise_pred, target)
+                    
+                    # Reshape student features to [B, T, N, D]
+                    # student_features is [B*num_goals, num_patches, hidden_dim]
+                    student_features = student_features.reshape(B, num_goals, -1, student_features.shape[-1])
+                    
+                    # Teacher features only contains goal frames, same as student
+                    # No slicing needed - teacher_features is already [B, num_goals, N, D]
+                    
+                    # Compute AC-REPA loss
+                    total_loss, ac_repa_loss_dict = ac_repa_loss_fn(
+                        student_features,  # [B, num_goals, N, D] - from goal frames
+                        teacher_features,  # [B, num_goals, N, D] - from same goal frames  
+                        goal_actions,  # Use goal frame actions [B, num_goals, 3]
+                        diffusion_loss
+                    )
+                    loss = total_loss
+                    loss_dict = {"loss": diffusion_loss, **ac_repa_loss_dict}
+                else:
+                    # Standard diffusion-only training
+                    model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+                    loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
+                    loss = loss_dict["loss"].mean()
 
-            opt.zero_grad()
+            # opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             if not bfloat_enable:
                 loss.backward()
                 opt.step()
@@ -304,10 +572,17 @@ def main(args):
                 scaler.step(opt)
                 scaler.update()
             
-            update_ema(ema, model.module)
+            update_ema(ema, model.module if is_distributed else model)
 
             # Log loss values:
             running_loss += loss.detach().item()
+            
+            # Track AC-REPA loss components if enabled
+            if config.get('use_ac_repa', False) and 'diffusion_loss' in loss_dict:
+                running_diffusion_loss += loss_dict['diffusion_loss']
+                running_fa_loss += loss_dict['fa_loss']
+                running_trd_loss += loss_dict['trd_loss']
+            
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -315,14 +590,46 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = dist.get_world_size()*x_cond.shape[0]*steps_per_sec
+                samples_per_sec = world_size*x_cond.shape[0]*steps_per_sec
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                if is_distributed:
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / world_size
+                else:
+                    avg_loss = avg_loss.item()
+                
+                # Log to both logger and W&B
+                log_message = f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}"
+                logger.info(log_message)
+                
+                # Log metrics to W&B
+                if wandb_run:
+                    wandb_metrics = {
+                        "train/loss": avg_loss,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/samples_per_sec": samples_per_sec,
+                        "train/epoch": epoch,
+                        "train/learning_rate": opt.param_groups[0]['lr'],
+                        "system/gpu_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+                    }
+                    
+                    # Add AC-REPA loss components if enabled
+                    if config.get('use_ac_repa', False) and running_diffusion_loss > 0:
+                        wandb_metrics["train/diffusion_loss"] = running_diffusion_loss / log_steps
+                        wandb_metrics["train/fa_loss"] = running_fa_loss / log_steps
+                        wandb_metrics["train/trd_loss"] = running_trd_loss / log_steps
+                        
+                        # Also log to console
+                        logger.info(f"  AC-REPA Components - Diffusion: {running_diffusion_loss/log_steps:.4f}, FA: {running_fa_loss/log_steps:.4f}, TRD: {running_trd_loss/log_steps:.4f}")
+                    
+                    wandb_run.log(wandb_metrics, step=train_steps)
+                
                 # Reset monitoring variables:
                 running_loss = 0
+                running_diffusion_loss = 0
+                running_fa_loss = 0
+                running_trd_loss = 0
                 log_steps = 0
                 start_time = time()
 
@@ -330,7 +637,7 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": (model.module if is_distributed else model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args,
@@ -345,43 +652,120 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
                         torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    
+                    # Log checkpoint to W&B (only if explicitly enabled)
+                    if wandb_run and args.wandb_save_checkpoints:
+                        # Save model artifact
+                        artifact = wandb.Artifact(
+                            name=f"model-checkpoint-{train_steps}",
+                            type="model",
+                            description=f"Model checkpoint at step {train_steps}"
+                        )
+                        artifact.add_file(checkpoint_path)
+                        wandb_run.log_artifact(artifact)
+                        logger.info(f"Uploaded checkpoint to W&B: model-checkpoint-{train_steps}")
+                    elif wandb_run:
+                        logger.info(f"Checkpoint saved locally only (W&B checkpoint saving disabled)")
             
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
-                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
-                dist.barrier()
+                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, is_distributed, world_size)
+                if is_distributed:
+                    dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
                 logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
+                
+                # Log evaluation metrics to W&B
+                if wandb_run and rank == 0:
+                    eval_metrics = {
+                        "eval/perceptual_loss": sim_score.item() if torch.is_tensor(sim_score) else sim_score,
+                        "eval/eval_time": eval_time,
+                    }
+                    wandb_run.log(eval_metrics, step=train_steps)
+                    
+                    # Log evaluation images as W&B artifacts (only if explicitly enabled)
+                    if args.wandb_save_eval_images and os.path.exists(save_dir):
+                        eval_artifact = wandb.Artifact(
+                            name=f"eval-images-{train_steps}",
+                            type="evaluation",
+                            description=f"Evaluation images at step {train_steps}"
+                        )
+                        for img_file in glob(f"{save_dir}/*.png"):
+                            eval_artifact.add_file(img_file)
+                        if len(glob(f"{save_dir}/*.png")) > 0:
+                            wandb_run.log_artifact(eval_artifact)
+                            logger.info(f"Uploaded evaluation images to W&B: eval-images-{train_steps}")
+                    elif os.path.exists(save_dir):
+                        logger.info(f"Evaluation images saved locally only (W&B image artifact saving disabled)")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    
+    # Finish W&B run and cleanup
+    if wandb_run:
+        # Log final metrics
+        if rank == 0:
+            wandb_run.log({
+                "training/final_epoch": epoch,
+                "training/final_steps": train_steps,
+                "training/status": "completed"
+            })
+        wandb.finish()
+    
+    # Clean up run_id file if we're the primary node
+    if is_distributed and rank == 0:
+        cleanup_run_id_file(config)
+    
     cleanup()
 
 
 @torch.no_grad
-def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
-    sampler = DistributedSampler(
-        test_dataloaders,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=seed
-    )
+def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond, is_distributed, world_size):
+    if is_distributed:
+        sampler = DistributedSampler(
+            test_dataloaders,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed
+        )
+        shuffle = False
+    else:
+        sampler = None
+        shuffle = True
+    
     loader = DataLoader(
         test_dataloaders,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True
     )
-    from dreamsim import dreamsim
-    eval_model, _ = dreamsim(pretrained=True)
+    
+    # Initialize DreamSim model with distributed-safe loading
+    if is_distributed:
+        # Only rank 0 downloads the model to avoid race conditions
+        if rank == 0:
+            from dreamsim import dreamsim
+            eval_model, _ = dreamsim(pretrained=True)
+        
+        # Wait for rank 0 to finish downloading
+        dist.barrier()
+        
+        # Now all ranks can safely load the model
+        if rank != 0:
+            from dreamsim import dreamsim
+            eval_model, _ = dreamsim(pretrained=True)
+    else:
+        from dreamsim import dreamsim
+        eval_model, _ = dreamsim(pretrained=True)
+    
     score = torch.tensor(0.).to(device)
     n_samples = torch.tensor(0).to(device)
 
@@ -414,8 +798,9 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
             plt.savefig(f'{save_dir}/{i}.png')
             plt.close()
 
-    dist.all_reduce(score)
-    dist.all_reduce(n_samples)
+    if is_distributed:
+        dist.all_reduce(score)
+        dist.all_reduce(n_samples)
     sim_score = score/n_samples
     return sim_score
 
@@ -430,7 +815,150 @@ def get_args_parser():
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
+    parser.add_argument("--single-gpu", type=int, default=1)
+    
+    # W&B arguments
+    parser.add_argument("--wandb-project", type=str, default="nwm", help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--wandb-tags", type=str, nargs="*", default=[], help="W&B tags for the run")
+    parser.add_argument("--wandb-disabled", action="store_true", help="Disable W&B logging")
+    parser.add_argument("--wandb-save-checkpoints", action="store_true", help="Save model checkpoints to W&B as artifacts")
+    parser.add_argument("--wandb-save-eval-images", action="store_true", help="Save evaluation images to W&B as artifacts")
+    
     return parser
+
+def init_wandb(args, config, rank, world_size, is_distributed):
+    """
+    Initialize Weights & Biases logging.
+    
+    Default behavior: ALWAYS FRESH (no resuming) unless --allow-resume is specified.
+    For single GPU: Standard wandb.init()
+    For distributed: Use shared mode with primary/worker node distinction
+    """
+    # Check if W&B is disabled
+    if args.wandb_disabled:
+        print("W&B logging disabled via --wandb-disabled flag")
+        return None, None
+    
+    # Enable wandb service for better reliability in distributed settings
+    if hasattr(wandb, 'require'):
+        wandb.require("service")
+    
+    # Prepare wandb config by merging args and config
+    # Override config values with command line arguments if provided
+    wandb_config = {
+        **config,      # Configuration from YAML files
+        **vars(args),  # Command line arguments (these take precedence)
+    }
+    
+    # Use command line arguments for W&B settings, fallback to config file
+    project = args.wandb_project or config.get('wandb_project', 'nwm-training')
+    entity = args.wandb_entity or config.get('wandb_entity', None)
+    tags = args.wandb_tags + config.get('wandb_tags', [])
+    
+    # Determine if we should create fresh runs or allow resuming (from config)
+    allow_resume = config.get('allow_resume', False)  # Default: False (always start fresh)
+    if not allow_resume:
+        # Add timestamp to ensure unique run names (no resuming)
+        import time
+        timestamp = int(time.time())
+        fresh_suffix = f"_{timestamp}"
+        fresh_tag = "fresh-start"
+        fresh_note_suffix = " - FRESH START"
+        print("W&B: Creating FRESH run (no resuming)")
+    else:
+        fresh_suffix = ""
+        fresh_tag = "resume-enabled"
+        fresh_note_suffix = " - Resume Enabled"
+        print("W&B: Resume mode enabled")
+    
+    if is_distributed:
+        # Distributed training: Use shared mode
+        base_run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_distributed"
+        run_name = f"{base_run_name}{fresh_suffix}"
+        
+        if rank == 0:
+            # Primary node
+            run = wandb.init(
+                project=project,
+                entity=entity,
+                name=run_name,
+                config=wandb_config,
+                settings=wandb.Settings(
+                    mode="shared",
+                    x_primary=True,
+                    x_label=f"rank_{rank}",
+                    x_stats_gpu_device_ids=list(range(torch.cuda.device_count())),
+                ),
+                tags=["distributed", "training", fresh_tag] + tags,
+                notes=f"Distributed training with {world_size} processes{fresh_note_suffix}",
+            )
+            print(f"W&B initialized on primary node (rank {rank}) with run ID: {run.id}")
+            return run, run.id
+        else:
+            # Worker nodes need the run_id from primary node
+            # In practice, you'd share this via environment variable or file
+            # For now, we'll create a temporary approach
+            import time
+            import os
+            
+            # Wait for primary node to create run_id file
+            run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+            max_wait = 60  # seconds
+            waited = 0
+            
+            while not os.path.exists(run_id_file) and waited < max_wait:
+                time.sleep(1)
+                waited += 1
+            
+            if os.path.exists(run_id_file):
+                with open(run_id_file, 'r') as f:
+                    run_id = f.read().strip()
+                
+                run = wandb.init(
+                    project=project,
+                    entity=entity,
+                    id=run_id,
+                    settings=wandb.Settings(
+                        mode="shared",
+                        x_primary=False,
+                        x_label=f"rank_{rank}",
+                        x_update_finish_state=False,
+                    ),
+                )
+                print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
+                return run, run_id
+            else:
+                print(f"Warning: Could not get run_id from primary node (rank {rank})")
+                return None, None
+    else:
+        # Single GPU training: Standard initialization
+        base_run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_single_gpu"
+        run_name = f"{base_run_name}{fresh_suffix}"
+        
+        run = wandb.init(
+            project=project,
+            entity=entity,
+            name=run_name,
+            config=wandb_config,
+            tags=["single-gpu", "training", fresh_tag] + tags,
+            notes=f"Single GPU training{fresh_note_suffix}",
+        )
+        print(f"W&B initialized for single GPU training with run ID: {run.id}")
+        return run, run.id
+
+def save_run_id_for_workers(run_id, config):
+    """Save run_id to a file for worker nodes to access"""
+    run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+    with open(run_id_file, 'w') as f:
+        f.write(run_id)
+
+def cleanup_run_id_file(config):
+    """Clean up the run_id file"""
+    run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
+    if os.path.exists(run_id_file):
+        os.remove(run_id_file)
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()

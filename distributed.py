@@ -99,6 +99,19 @@ def init_distributed(port=37124, rank_and_world_size=(None, None)):
     # setup_for_distributed(rank == 0)
     return world_size, rank, gpu, True
 
+def init_single_gpu():
+    """
+    Initialize for single GPU training without distributed features.
+    Returns world_size=1, rank=0, device=0, distributed=False
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available for single GPU training")
+    
+    device = 0
+    torch.cuda.set_device(device)
+    
+    # Don't initialize distributed training
+    return 1, 0, device, False
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
