@@ -3,7 +3,6 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#from distributed import init_distributed
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -18,6 +17,7 @@ from diffusers.models import AutoencoderKL
 
 import misc
 import distributed as dist
+from distributed import init_distributed, init_single_gpu
 from models import CDiT_models
 from datasets import EvalDataset
 from PIL import Image
@@ -125,11 +125,18 @@ def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
 
 @torch.no_grad
 def main(args):
-    _, _, device, _ = init_distributed()
+    # Setup evaluation mode (distributed or single GPU):
+    if args.single_gpu:
+        world_size, rank, device, is_distributed = init_single_gpu()
+        print(f"Starting single GPU evaluation on device {device}")
+    else:
+        world_size, rank, device, is_distributed = init_distributed()
+        print(f"Starting distributed evaluation: rank={rank}, world_size={world_size}")
+    
     print(args)
     device = torch.device(device)
-    num_tasks = dist.get_world_size()
-    global_rank = dist.get_rank()
+    num_tasks = world_size
+    global_rank = rank
     exp_eval = args.exp
 
     # model & config setup
@@ -139,8 +146,14 @@ def main(args):
         exp_name = os.path.basename(exp_eval).split('.')[0]
         args.save_output_dir = os.path.join(args.output_dir, exp_name)
     
-    if  args.ckp != '0100000':
-        args.save_output_dir = args.save_output_dir + "_%s"%(args.ckp)
+    # Add checkpoint suffix to output directory
+    if args.ckp_path:
+        # Extract checkpoint name from path (e.g., "0400000" from "/path/to/0400000.pth.tar")
+        ckp_name = os.path.basename(args.ckp_path).replace('.pth.tar', '')
+        if ckp_name != '0100000':
+            args.save_output_dir = args.save_output_dir + "_%s" % ckp_name
+    elif args.ckp != '0100000':
+        args.save_output_dir = args.save_output_dir + "_%s" % args.ckp
 
     os.makedirs(args.save_output_dir, exist_ok=True)
 
@@ -160,14 +173,25 @@ def main(args):
     model_lst = (None, None, None)
     if not args.gt:
         model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
-        ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
+        
+        # Use ckp_path if provided, otherwise construct from config
+        if args.ckp_path:
+            checkpoint_path = args.ckp_path
+            print(f"Loading checkpoint from: {checkpoint_path}")
+        else:
+            checkpoint_path = f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar'
+            print(f"Loading checkpoint from: {checkpoint_path}")
+        
+        ckp = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         print(model.load_state_dict(ckp["ema"], strict=True))
         model.eval()
         model.to(device)
         model = torch.compile(model)
         diffusion = create_diffusion(str(250))
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=False)
+        # Only wrap in DDP if using distributed mode
+        if is_distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=False)
         model_lst = (model, diffusion, vae)
 
     # Loading Datasets
@@ -177,15 +201,23 @@ def main(args):
     for dataset_name in dataset_names:
         dataset_val = get_dataset_eval(config, dataset_name, args.eval_type, predefined_index=True)
 
-        if len(dataset_val) % num_tasks != 0:
-            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                    'equal num of samples per-process.')
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+        # Setup data loading with or without distributed sampling
+        if is_distributed:
+            if len(dataset_val) % num_tasks != 0:
+                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                        'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                        'equal num of samples per-process.')
+            sampler_val = torch.utils.data.DistributedSampler(
+                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+            shuffle = False
+        else:
+            sampler_val = None
+            shuffle = False
 
         curr_data_loader = torch.utils.data.DataLoader(
-                            dataset_val, sampler=sampler_val,
+                            dataset_val, 
+                            sampler=sampler_val,
+                            shuffle=shuffle,
                             batch_size=args.batch_size,
                             num_workers=args.num_workers,
                             pin_memory=True,
@@ -224,7 +256,8 @@ if __name__ == "__main__":
     
     parser.add_argument("--output_dir", type=str, default=None, help="output directory")
     parser.add_argument("--exp", type=str, default=None, help="experiment name")
-    parser.add_argument("--ckp", type=str, default='0100000')
+    parser.add_argument("--ckp", type=str, default='0100000', help="checkpoint name")
+    parser.add_argument("--ckp_path", type=str, default=None, help="full path to checkpoint file (overrides --ckp)")
     parser.add_argument("--num_sec_eval", type=int, default=5)
     parser.add_argument("--input_fps", type=int, default=4)
     parser.add_argument("--datasets", type=str, default=None, help="dataset name")
@@ -234,6 +267,7 @@ if __name__ == "__main__":
     # Rollout Evaluation Args
     parser.add_argument("--rollout_fps_values", type=str, default='1,4', help="")
     parser.add_argument("--gt", type=int, default=0, help="set to 1 to produce ground truth evaluation set")
+    parser.add_argument("--single-gpu", type=int, default=1, help="set to 1 for single GPU mode, 0 for distributed")
     args = parser.parse_args()
     
     args.rollout_fps_values = [int(fps) for fps in args.rollout_fps_values.split(',')]
