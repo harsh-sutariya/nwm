@@ -177,8 +177,8 @@ def main(args):
         
         # Initialize AC-REPA loss with dynamic student dimension
         # Automatically infer student_dim from the chosen CDiT model
-        actual_student_dim = model.module.blocks[0].norm1.normalized_shape[0] if is_distributed else model.blocks[0].norm1.normalized_shape[0]
-        num_layers = len(model.module.blocks) if is_distributed else len(model.blocks)
+        actual_student_dim = model.blocks[0].norm1.normalized_shape[0]
+        num_layers = len(model.blocks)
         target_extraction_layer = max(0, int(num_layers * 0.67) - 1) + 1  # +1 for human-readable (1-indexed)
         logger.info(f"Auto-detected student model: {num_layers} layers, hidden_dim={actual_student_dim}, extracting from layer {target_extraction_layer}")
         
