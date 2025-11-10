@@ -16,7 +16,7 @@ lr: 8e-5
 
 # Quick debug mode: runs only a few steps (3) through all processes for testing
 # Default: false (full training)
-quick_debug: true
+quick_debug: false
 
 # normalization for the action space
 normalize: True

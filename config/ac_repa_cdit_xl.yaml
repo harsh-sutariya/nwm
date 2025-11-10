@@ -9,7 +9,7 @@ wandb_run_name: null
 
 # Quick debug mode: runs only a few steps (3) through all processes for testing
 # Default: false (full training)
-quick_debug: true
+quick_debug: false
 
 # training setup
 results_dir: logs
