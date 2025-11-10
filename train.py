@@ -641,7 +641,8 @@ def main(args):
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Use batch size from config for samples/sec calculation
                 samples_per_sec = world_size * config['batch_size'] * steps_per_sec
-                # Reduce loss history over all processes:
+                
+                # CRITICAL: Reduce loss history over all processes for accurate multi-GPU logging
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 if is_distributed:
                     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
@@ -649,12 +650,38 @@ def main(args):
                 else:
                     avg_loss = avg_loss.item()
                 
+                # CRITICAL: Reduce AC-REPA loss components across all GPUs
+                avg_diffusion_loss = None
+                avg_fa_loss = None
+                avg_trd_loss = None
+                if config.get('use_ac_repa', False) and running_diffusion_loss > 0:
+                    # Create tensors for reduction
+                    diffusion_loss_tensor = torch.tensor(running_diffusion_loss / log_steps, device=device)
+                    fa_loss_tensor = torch.tensor(running_fa_loss / log_steps, device=device)
+                    trd_loss_tensor = torch.tensor(running_trd_loss / log_steps, device=device)
+                    
+                    if is_distributed:
+                        dist.all_reduce(diffusion_loss_tensor, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(fa_loss_tensor, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(trd_loss_tensor, op=dist.ReduceOp.SUM)
+                        avg_diffusion_loss = diffusion_loss_tensor.item() / world_size
+                        avg_fa_loss = fa_loss_tensor.item() / world_size
+                        avg_trd_loss = trd_loss_tensor.item() / world_size
+                    else:
+                        avg_diffusion_loss = diffusion_loss_tensor.item()
+                        avg_fa_loss = fa_loss_tensor.item()
+                        avg_trd_loss = trd_loss_tensor.item()
+                
                 # Log to both logger and W&B
                 log_message = f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}"
                 logger.info(log_message)
                 
-                # Log metrics to W&B
-                if wandb_run:
+                # Log AC-REPA components to console (already reduced)
+                if config.get('use_ac_repa', False) and avg_diffusion_loss is not None:
+                    logger.info(f"  AC-REPA Components - Diffusion: {avg_diffusion_loss:.4f}, FA: {avg_fa_loss:.4f}, TRD: {avg_trd_loss:.4f}")
+                
+                # Log metrics to W&B (only rank 0 logs to avoid duplicate entries)
+                if wandb_run and rank == 0:
                     wandb_metrics = {
                         "train/loss": avg_loss,
                         "train/steps_per_sec": steps_per_sec,
@@ -664,14 +691,11 @@ def main(args):
                         "system/gpu_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
                     }
                     
-                    # Add AC-REPA loss components if enabled
-                    if config.get('use_ac_repa', False) and running_diffusion_loss > 0:
-                        wandb_metrics["train/diffusion_loss"] = running_diffusion_loss / log_steps
-                        wandb_metrics["train/fa_loss"] = running_fa_loss / log_steps
-                        wandb_metrics["train/trd_loss"] = running_trd_loss / log_steps
-                        
-                        # Also log to console
-                        logger.info(f"  AC-REPA Components - Diffusion: {running_diffusion_loss/log_steps:.4f}, FA: {running_fa_loss/log_steps:.4f}, TRD: {running_trd_loss/log_steps:.4f}")
+                    # Add AC-REPA loss components (already reduced across GPUs)
+                    if config.get('use_ac_repa', False) and avg_diffusion_loss is not None:
+                        wandb_metrics["train/diffusion_loss"] = avg_diffusion_loss
+                        wandb_metrics["train/fa_loss"] = avg_fa_loss
+                        wandb_metrics["train/trd_loss"] = avg_trd_loss
                     
                     wandb_run.log(wandb_metrics, step=train_steps)
                 
@@ -953,15 +977,23 @@ def init_wandb(args, config, rank, world_size, is_distributed):
     
     if is_distributed:
         # Distributed training: Use shared mode
+        # BEST PRACTICE: Use distributed broadcast for run_id sharing (most reliable)
+        import os
+        import torch.distributed as dist
+        
         base_run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_distributed"
         run_name = f"{base_run_name}{fresh_suffix}"
         
+        # Check if run_id is pre-set via environment variable (e.g., from external launcher)
+        run_id_from_env = os.environ.get('WANDB_RUN_ID', None)
+        
         if rank == 0:
-            # Primary node
+            # Primary node: Create new run
             run = wandb.init(
                 project=project,
                 entity=entity,
                 name=run_name,
+                id=run_id_from_env,  # Use env var if provided, otherwise create new
                 config=wandb_config,
                 settings=wandb.Settings(
                     mode="shared",
@@ -972,44 +1004,49 @@ def init_wandb(args, config, rank, world_size, is_distributed):
                 tags=["distributed", "training", fresh_tag] + tags,
                 notes=f"Distributed training with {world_size} processes{fresh_note_suffix}",
             )
-            print(f"W&B initialized on primary node (rank {rank}) with run ID: {run.id}")
-            return run, run.id
-        else:
-            # Worker nodes need the run_id from primary node
-            # In practice, you'd share this via environment variable or file
-            # For now, we'll create a temporary approach
-            import time
-            import os
+            run_id = run.id
             
-            # Wait for primary node to create run_id file
+            # BEST PRACTICE: Store run_id in file before barrier so workers can read it
+            # Use distributed barrier for synchronization (more reliable than polling)
+            save_run_id_for_workers(run_id, config)
+            
+            print(f"W&B initialized on primary node (rank {rank}) with run ID: {run_id}")
+        
+        # BEST PRACTICE: Use distributed barrier for synchronization
+        # Barrier ensures all processes wait for rank 0 to finish W&B init and create run_id file
+        dist.barrier()
+        
+        if rank != 0:
+            # Worker nodes: Read run_id from file (created by rank 0 before barrier)
+            # After barrier, file is guaranteed to exist
             run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
-            max_wait = 60  # seconds
-            waited = 0
-            
-            while not os.path.exists(run_id_file) and waited < max_wait:
-                time.sleep(1)
-                waited += 1
             
             if os.path.exists(run_id_file):
                 with open(run_id_file, 'r') as f:
                     run_id = f.read().strip()
-                
-                run = wandb.init(
-                    project=project,
-                    entity=entity,
-                    id=run_id,
-                    settings=wandb.Settings(
-                        mode="shared",
-                        x_primary=False,
-                        x_label=f"rank_{rank}",
-                        x_update_finish_state=False,
-                    ),
-                )
-                print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
-                return run, run_id
             else:
-                print(f"Warning: Could not get run_id from primary node (rank {rank})")
+                # Fallback: This shouldn't happen after barrier, but handle gracefully
+                print(f"Error: run_id file not found after barrier (rank {rank})")
                 return None, None
+        
+        # All workers (including rank 0) now have run_id
+        if rank == 0:
+            return run, run_id
+        else:
+            # Worker nodes: Join existing run
+            run = wandb.init(
+                project=project,
+                entity=entity,
+                id=run_id,
+                settings=wandb.Settings(
+                    mode="shared",
+                    x_primary=False,
+                    x_label=f"rank_{rank}",
+                    x_update_finish_state=False,
+                ),
+            )
+            print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
+            return run, run_id
     else:
         # Single GPU training: Standard initialization
         base_run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_single_gpu"
