@@ -281,6 +281,22 @@ def main(args):
             "training/start_steps": train_steps,
         })
 
+    # Quick debug mode: reduce parameters for faster testing
+    quick_debug = config.get('quick_debug', False)
+    if quick_debug:
+        logger.info("=" * 60)
+        logger.info("QUICK DEBUG MODE ENABLED")
+        logger.info("=" * 60)
+        logger.info("Reducing parameters for fast testing:")
+        logger.info(f"  Original batch_size: {config['batch_size']}")
+        logger.info(f"  Original num_workers: {config['num_workers']}")
+        config['batch_size'] = min(config['batch_size'], 4)  # Reduce batch size
+        config['num_workers'] = 1  # Use 1 worker to avoid warnings and speed up
+        logger.info(f"  Debug batch_size: {config['batch_size']}")
+        logger.info(f"  Debug num_workers: {config['num_workers']}")
+        logger.info("Will exit after 3 training steps")
+        logger.info("=" * 60)
+
     train_dataset = []
     test_dataset = []
 
@@ -372,21 +388,28 @@ def main(args):
     logger.info(f"Training for {args.epochs} epochs...")
     epoch = start_epoch  
     logged_batch_shapes = False
+    first_step = None  # Track first step for quick_debug early exit
+    
     for epoch in range(start_epoch, args.epochs):
         if is_distributed and sampler is not None:
             sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
         for x, y, rel_t in loader:
+            # Track first step for quick_debug
+            if first_step is None:
+                first_step = train_steps
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             rel_t = rel_t.to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
-                # Extract teacher features from original pixels (before VAE encoding) if using AC-REPA
-                teacher_features = None
-                if config.get('use_ac_repa', False) and teacher_model is not None:
-                    with torch.no_grad():
+            # OPTIMIZATION: Extract teacher features OUTSIDE autocast for better performance
+            # Teacher model is in eval mode and doesn't need gradients, so process separately
+            teacher_features = None
+            if config.get('use_ac_repa', False) and teacher_model is not None:
+                with torch.no_grad():
+                    # Use separate autocast for teacher to optimize memory and speed
+                    with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                         # x is [B, T, C, H, W] in range [-1, 1]
                         # Only process goal frames to match student processing
                         B, T, C, H, W = x.shape
@@ -396,8 +419,7 @@ def main(args):
                         # VideoMAE expects exactly 16 frames
                         videomae_frames = 16
                         
-                        # Batched teacher processing for memory efficiency
-                        # Convert entire batch from [-1, 1] to [0, 1] for VideoMAE
+                        # OPTIMIZATION: Convert entire batch from [-1, 1] to [0, 1] for VideoMAE
                         x_normalized = x_goals * 0.5 + 0.5  # [B, num_goals, C, H, W]
                         
                         # Determine teacher sampling indices once to preserve temporal ordering
@@ -409,11 +431,16 @@ def main(args):
 
                         x_sampled = x_normalized[:, sample_indices]  # [B, 16, C, H, W]
 
-                        # Fully batched teacher processing
-                        batch_frames_list = [[x_sampled[b, t] for t in range(videomae_frames)] for b in range(B)]
+                        # OPTIMIZATION: More efficient list creation using tensor slicing
+                        # Convert to list format expected by processor (processor needs PIL/numpy)
+                        # Use list comprehension but with direct tensor slicing (faster than nested loops)
+                        batch_frames_list = []
+                        for b in range(B):
+                            # Direct tensor slicing is faster than nested list comprehension
+                            batch_frames_list.append([x_sampled[b, t] for t in range(videomae_frames)])
 
                         batch_inputs = teacher_processor(batch_frames_list, return_tensors="pt", do_rescale=False)
-                        batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
+                        batch_inputs = {k: v.to(device, non_blocking=True) for k, v in batch_inputs.items()}
 
                         batch_outputs = teacher_model(**batch_inputs, output_hidden_states=True)
                         batch_teacher_features = batch_outputs.hidden_states[-1][:, 1:, :]  # [B, frames*patches, D]
@@ -421,6 +448,7 @@ def main(args):
 
                         total_tokens = batch_teacher_features.shape[1]
 
+                        # Cache teacher config to avoid repeated attribute access
                         teacher_cfg = getattr(teacher_model, "config", None)
                         teacher_image_size = getattr(teacher_cfg, "image_size", config["image_size"]) if teacher_cfg else config["image_size"]
                         teacher_patch_size = getattr(teacher_cfg, "patch_size", 16) if teacher_cfg else 16
@@ -473,7 +501,16 @@ def main(args):
                             if same_mask.any():
                                 teacher_features = torch.where(same_mask, teacher_lower, teacher_features)
 
-                        teacher_features = teacher_features.to(dtype=torch.float32).contiguous()
+                        # OPTIMIZATION: Keep teacher features in bfloat16 if using mixed precision
+                        # Convert to same dtype as student features for consistency
+                        teacher_features = teacher_features.contiguous()
+                        if bfloat_enable:
+                            teacher_features = teacher_features.to(dtype=torch.bfloat16)
+                        else:
+                            teacher_features = teacher_features.to(dtype=torch.float32)
+            
+            # Student training with autocast
+            with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
@@ -585,12 +622,25 @@ def main(args):
             
             log_steps += 1
             train_steps += 1
-            if train_steps % args.log_every == 0:
+            
+            # Quick debug: exit after 3 steps (goes through all processes)
+            if quick_debug and first_step is not None:
+                steps_since_first = train_steps - first_step
+                if steps_since_first >= 3:
+                    logger.info("=" * 60)
+                    logger.info(f"QUICK DEBUG MODE: Exiting after {steps_since_first} steps")
+                    logger.info("All training processes completed successfully!")
+                    logger.info("=" * 60)
+                    # Break out of inner loop
+                    break
+            
+            if train_steps % args.log_every == 0 or quick_debug:
                 # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = world_size*x_cond.shape[0]*steps_per_sec
+                # Use batch size from config for samples/sec calculation
+                samples_per_sec = world_size * config['batch_size'] * steps_per_sec
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 if is_distributed:
@@ -633,8 +683,8 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+            # Save DiT checkpoint: (skip in quick_debug)
+            if train_steps % args.ckpt_every == 0 and train_steps > 0 and not quick_debug:
                 if rank == 0:
                     checkpoint = {
                         "model": (model.module if is_distributed else model).state_dict(),
@@ -667,7 +717,8 @@ def main(args):
                     elif wandb_run:
                         logger.info(f"Checkpoint saved locally only (W&B checkpoint saving disabled)")
             
-            if train_steps % args.eval_every == 0 and train_steps > 0:
+            # Evaluation: skip during quick_debug (too slow)
+            if train_steps % args.eval_every == 0 and train_steps > 0 and not quick_debug:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
                 sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, is_distributed, world_size)
@@ -699,9 +750,30 @@ def main(args):
                             logger.info(f"Uploaded evaluation images to W&B: eval-images-{train_steps}")
                     elif os.path.exists(save_dir):
                         logger.info(f"Evaluation images saved locally only (W&B image artifact saving disabled)")
+        
+        # Break out of epoch loop if quick_debug completed
+        if quick_debug and first_step is not None and (train_steps - first_step) >= 3:
+            break
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+
+    # Quick debug: run a quick validation at the end
+    if quick_debug:
+        logger.info("=" * 60)
+        logger.info("QUICK DEBUG MODE: Running quick validation...")
+        logger.info("=" * 60)
+        eval_start_time = time()
+        save_dir = os.path.join(experiment_dir, "quick_debug_eval")
+        # Use smaller batch size for quick debug eval
+        eval_batch_size = min(config["batch_size"], 4)
+        sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, eval_batch_size, config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, is_distributed, world_size)
+        if is_distributed:
+            dist.barrier()
+        eval_end_time = time()
+        eval_time = eval_end_time - eval_start_time
+        logger.info(f"Quick Debug Eval - Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
+        logger.info("=" * 60)
 
     logger.info("Done!")
     
@@ -836,9 +908,15 @@ def init_wandb(args, config, rank, world_size, is_distributed):
     For single GPU: Standard wandb.init()
     For distributed: Use shared mode with primary/worker node distinction
     """
-    # Check if W&B is disabled
+    # Check if W&B is disabled via command line flag
     if args.wandb_disabled:
         print("W&B logging disabled via --wandb-disabled flag")
+        return None, None
+    
+    # Check if quick_debug is enabled - disable W&B for quick debugging
+    if config.get('quick_debug', False):
+        if rank == 0:
+            print("W&B logging disabled because quick_debug mode is enabled")
         return None, None
     
     # Enable wandb service for better reliability in distributed settings

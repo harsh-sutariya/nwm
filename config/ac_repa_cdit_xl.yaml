@@ -7,6 +7,10 @@ wandb_run_name: null
 # Default: false (always start fresh training)
 # allow_resume: false
 
+# Quick debug mode: runs only a few steps (3) through all processes for testing
+# Default: false (full training)
+quick_debug: true
+
 # training setup
 results_dir: logs
 train: True

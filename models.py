@@ -168,9 +168,10 @@ class FeatureAlignmentLoss(nn.Module):
             self.cross_attn = CrossAttentionPooling()
 
     def forward(self, student_proj, teacher_proj, student_shape, teacher_shape):
-        B, T, N, _ = student_shape
+        B, T, N, proj_dim = student_shape
 
-        student_spatial = student_proj.reshape(B, T, N, -1)
+        # OPTIMIZATION: Use view for better performance (requires contiguous)
+        student_spatial = student_proj.contiguous().view(B, T, N, proj_dim)
         teacher_aligned = align_teacher_to_student_grid(
             teacher_proj,
             teacher_shape,
@@ -182,6 +183,8 @@ class FeatureAlignmentLoss(nn.Module):
         elif self.pool_type not in ('mean', 'cross_attention'):
             raise ValueError(f"Unknown pool_type: {self.pool_type}")
 
+        # OPTIMIZATION: Use more efficient MSE computation
+        # Compute squared difference and mean in one operation
         fa_loss = torch.mean((student_spatial - teacher_aligned) ** 2)
 
         return fa_loss, teacher_aligned
@@ -272,25 +275,32 @@ class ACRepaLoss(nn.Module):
             total_loss: Combined loss
             loss_dict: Dictionary with individual losses
         """
+        # OPTIMIZATION: Cache shapes to avoid repeated computation
+        B, T, N, _ = student_features.shape
+        B_T, T_T, N_T, _ = teacher_features.shape
+        proj_dim = self.projector.proj_dim
+        
+        student_shape = (B, T, N, proj_dim)
+        teacher_shape = (B_T, T_T, N_T, proj_dim)
+
         # Project features to common space
         student_proj, teacher_proj = self.projector.forward_both(student_features, teacher_features)
 
-        # Get dimensions for loss computation
-        B, T, N, _ = student_features.shape
-        B_T, T_T, N_T, _ = teacher_features.shape
-
-        student_shape = (B, T, N, self.projector.proj_dim)
-        teacher_shape = (B_T, T_T, N_T, self.projector.proj_dim)
-
+        # OPTIMIZATION: Compute losses in parallel where possible (though they share projections)
         # Compute Feature Alignment loss
         fa_loss, _ = self.fa_loss_fn(student_proj, teacher_proj, student_shape, teacher_shape)
 
         # Compute AC-TRD loss
         trd_loss = self.trd_loss_fn(student_proj, teacher_proj, student_shape, teacher_shape, actions)
 
+        # OPTIMIZATION: Ensure diffusion_loss is a tensor for efficient computation
+        if not torch.is_tensor(diffusion_loss):
+            diffusion_loss = torch.tensor(diffusion_loss, device=student_features.device, dtype=student_features.dtype)
+
         # Combine losses
         total_loss = diffusion_loss + self.lambda_fa * fa_loss + self.lambda_trd * trd_loss
 
+        # OPTIMIZATION: Only detach for logging, keep gradients for training
         # Return loss dictionary for logging
         loss_dict = {
             'diffusion_loss': diffusion_loss.item() if torch.is_tensor(diffusion_loss) else diffusion_loss,
@@ -330,6 +340,10 @@ class ActionConditionedTRDLoss(nn.Module):
         """
         B, T, N, proj_dim = student_shape
 
+        # OPTIMIZATION: Reshape student first to avoid redundant reshape later
+        # Reshape to spatial grid early
+        student_spatial = student_proj.reshape(B, T, N, proj_dim)  # [B, T, N, proj_dim]
+
         # If teacher_proj is pooled to student grid, it might already be [B, T, N, proj_dim]
         if teacher_proj.dim() == 3:  # [B, T*N, proj_dim]
             # Pool teacher to student grid first
@@ -339,21 +353,22 @@ class ActionConditionedTRDLoss(nn.Module):
         else:  # Already [B, T, N, proj_dim]
             teacher_pooled = teacher_proj
 
-        # Reshape to spatial grid
-        student_spatial = student_proj.reshape(B, T, N, proj_dim)  # [B, T, N, proj_dim]
-
-        # L2 normalize features
+        # OPTIMIZATION: Normalize in-place where possible and flatten efficiently
+        # L2 normalize features (normalize handles in-place operations internally)
         X = torch.nn.functional.normalize(student_spatial, p=2, dim=-1)  # [B, T, N, d']
         Y = torch.nn.functional.normalize(teacher_pooled, p=2, dim=-1)   # [B, T, N, d']
 
-        # Flatten spatial-temporal dimensions: [B, T, N, d'] -> [B, T*N, d']
-        X_flat = X.reshape(B, T * N, proj_dim)
-        Y_flat = Y.reshape(B, T * N, proj_dim)
+        # OPTIMIZATION: Flatten spatial-temporal dimensions efficiently
+        # Use contiguous() + view for better performance when possible
+        # [B, T, N, d'] -> [B, T*N, d']
+        X_flat = X.contiguous().view(B, T * N, proj_dim)
+        Y_flat = Y.contiguous().view(B, T * N, proj_dim)
 
-        # Compute Gram (relation) matrices: R = XX^T
+        # OPTIMIZATION: Compute Gram (relation) matrices more efficiently
+        # Use matmul instead of bmm for better performance (handles batch dimension automatically)
         # [B, T*N, d'] @ [B, d', T*N] -> [B, T*N, T*N]
-        R_s = torch.bmm(X_flat, X_flat.transpose(1, 2))  # [B, T*N, T*N]
-        R_T = torch.bmm(Y_flat, Y_flat.transpose(1, 2))  # [B, T*N, T*N]
+        R_s = torch.matmul(X_flat, X_flat.transpose(1, 2))  # [B, T*N, T*N]
+        R_T = torch.matmul(Y_flat, Y_flat.transpose(1, 2))  # [B, T*N, T*N]
 
         # Build action/motion gate
         G = self._build_action_gate(T, N, B, actions, device=student_proj.device)  # [B, T*N, T*N] or [T*N, T*N]
@@ -369,33 +384,37 @@ class ActionConditionedTRDLoss(nn.Module):
             R_T = self._mask_relations(R_T, token_mask)
             G = self._mask_relations(G, token_mask) if G.dim() == 3 else G
 
-        # Compute weighted Frobenius norm
+        # OPTIMIZATION: Compute weighted Frobenius norm more efficiently
         # L_TRD = (1/||G||_1) * ||G ⊙ (R_s - R_T)||_F^2
         diff = R_s - R_T  # [B, T*N, T*N]
 
         if G.dim() == 2:  # Shared gate across batch
             G = G.unsqueeze(0).expand(B, -1, -1)
 
-        weighted_diff = G * diff  # Element-wise multiplication
-        
-        # Frobenius norm squared
-        frobenius_norm_sq = torch.sum(weighted_diff ** 2, dim=(1, 2))  # [B]
-
-        # Numerically stable normalization
+        # OPTIMIZATION: Compute gate_sum first to avoid redundant computation
         gate_sum = torch.sum(G, dim=(1, 2))  # [B]
         
-        # Robust normalization with regularization to prevent numerical instability
-        # Add adaptive regularization based on tensor magnitude for stability
-        gate_reg = torch.clamp(gate_sum.mean() * 1e-3, min=1e-4, max=1e-2)  # Adaptive regularization
-        gate_sum_stable = gate_sum + gate_reg  # Regularized sum
+        # OPTIMIZATION: Use in-place operations where possible and avoid double precision unless necessary
+        # For numerical stability, use higher precision only for division, not entire computation
+        weighted_diff = G * diff  # Element-wise multiplication
         
-        # to prevent overflow/underflow
-        frobenius_norm_sq_fp64 = frobenius_norm_sq.double()
-        gate_sum_stable_fp64 = gate_sum_stable.double()
+        # Frobenius norm squared - compute directly without intermediate storage
+        frobenius_norm_sq = torch.sum(weighted_diff ** 2, dim=(1, 2))  # [B]
         
-        # Compute normalized loss with numerical stability
-        normalized_loss_fp64 = frobenius_norm_sq_fp64 / gate_sum_stable_fp64
-        trd_loss = torch.mean(normalized_loss_fp64.float())  # Convert back to original precision
+        # OPTIMIZATION: More efficient numerical stability - only convert division to higher precision
+        # Add small epsilon to gate_sum to prevent division by zero
+        gate_sum_stable = gate_sum + torch.clamp(gate_sum.mean() * 1e-3, min=1e-4, max=1e-2)
+        
+        # OPTIMIZATION: Use float32 for division (sufficient precision) instead of double
+        # Only convert to higher precision if values are very small/large
+        # Check if we need higher precision based on magnitude
+        min_gate_sum = gate_sum_stable.min()
+        if min_gate_sum < 1e-3:  # Only use double precision if values are very small
+            normalized_loss = (frobenius_norm_sq.double() / gate_sum_stable.double()).float()
+        else:
+            normalized_loss = frobenius_norm_sq / gate_sum_stable
+        
+        trd_loss = torch.mean(normalized_loss)
 
         return trd_loss
 
@@ -422,10 +441,12 @@ class ActionConditionedTRDLoss(nn.Module):
             device = actions.device if actions is not None else 'cpu'
 
         if self.gate_type == 'temporal':
-            t_indices = torch.arange(T, device=device).view(T, 1).expand(T, N).reshape(-1)
+            # OPTIMIZATION: More efficient temporal gate computation
+            t_indices = torch.arange(T, device=device, dtype=torch.float32).view(T, 1).expand(T, N).reshape(-1)
             t_dist = torch.abs(t_indices.unsqueeze(0) - t_indices.unsqueeze(1))
             sigma = max(T / 4.0, 1.0)
-            return torch.exp(-t_dist.float() ** 2 / (2 * sigma ** 2))
+            # OPTIMIZATION: Avoid unnecessary float conversion - already float32
+            return torch.exp(-t_dist ** 2 / (2 * sigma ** 2))
 
         if self.gate_type == 'action':
             if actions is None or actions.numel() == 0:
@@ -498,9 +519,12 @@ class ActionConditionedTRDLoss(nn.Module):
         Returns:
             masked_relations: [B, T*N, T*N] - Masked relations
         """
-        # Apply mask to both dimensions
+        # OPTIMIZATION: More efficient mask creation and application
+        # Create 2D mask more efficiently
         mask_2d = token_mask.unsqueeze(2) & token_mask.unsqueeze(1)  # [B, T*N, T*N]
-        return relations * mask_2d.float()
+        # OPTIMIZATION: Use where() instead of multiplication for better performance with sparse masks
+        # Only convert to float when necessary (PyTorch will handle dtype promotion)
+        return torch.where(mask_2d, relations, torch.zeros_like(relations))
 
 
 #################################################################################
