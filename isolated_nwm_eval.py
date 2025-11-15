@@ -20,6 +20,9 @@ from torcheval.metrics import FrechetInceptionDistance
 from torchvision import transforms
 import distributed as dist
 
+# W&B
+import wandb
+
 
 def get_loss_fn(loss_fn_type, secs, device):
     if loss_fn_type == 'lpips':
@@ -140,6 +143,47 @@ def save_metric_to_disk(metric_logger, log_p):
 
 def main(args):
     device = 'cuda'
+    
+    # Initialize W&B if enabled
+    wandb_run = None
+    if args.wandb_enabled:
+        # Extract checkpoint name and config name for run naming
+        checkpoint_name = os.path.basename(args.exp_dir)
+        
+        wandb_config = {
+            'datasets': args.datasets,
+            'eval_types': ','.join(args.eval_types),
+            'num_sec_eval': args.num_sec_eval,
+            'checkpoint': checkpoint_name,
+        }
+        
+        # Add checkpoint metadata if provided
+        if args.wandb_checkpoint_epoch is not None:
+            wandb_config['checkpoint_epoch'] = args.wandb_checkpoint_epoch
+        if args.wandb_checkpoint_step is not None:
+            wandb_config['checkpoint_step'] = args.wandb_checkpoint_step
+        if args.wandb_checkpoint_path:
+            wandb_config['checkpoint_path'] = args.wandb_checkpoint_path
+        
+        # Create tags
+        tags = ['evaluation']
+        if args.wandb_tags:
+            tags.extend(args.wandb_tags.split(','))
+        
+        # Create run name
+        run_name = args.wandb_run_name or f"eval_{checkpoint_name}"
+        
+        # Initialize wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=args.wandb_group,
+            tags=tags,
+            config=wandb_config,
+            reinit=True
+        )
+        print(f"W&B run initialized: {wandb_run.name}")
           
     # Loading Datasets
     dataset_names = args.datasets.split(',')
@@ -169,6 +213,13 @@ def main(args):
                         evaluate(args, dataset_name, 'rollout', metric_logger, rollout_loss_fns, gt_dataset_rollout_dir, exp_dataset_rollout_dir, secs, rollout_fps)
                     output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                     save_metric_to_disk(metric_logger, output_fn)
+                    
+                    # Log to W&B if enabled
+                    if wandb_run:
+                        log_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+                        wandb_metrics = {f"eval/{dataset_name}_{eval_name}_{k}": v for k, v in log_stats.items()}
+                        wandb_run.log(wandb_metrics)
+                        print(f"Logged {eval_name} metrics to W&B for {dataset_name}")
                 except Exception as e:
                     print(e)
 
@@ -185,8 +236,20 @@ def main(args):
                     evaluate(args, dataset_name, eval_name, metric_logger, time_loss_fns, gt_dataset_time_dir, exp_dataset_time_dir, secs, None)
                 output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                 save_metric_to_disk(metric_logger, output_fn)
+                
+                # Log to W&B if enabled
+                if wandb_run:
+                    log_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+                    wandb_metrics = {f"eval/{dataset_name}_{eval_name}_{k}": v for k, v in log_stats.items()}
+                    wandb_run.log(wandb_metrics)
+                    print(f"Logged {eval_name} metrics to W&B for {dataset_name}")
             except Exception as e:
                 print(e)
+    
+    # Finish W&B run
+    if wandb_run:
+        wandb.finish()
+        print("W&B run finished")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -202,6 +265,17 @@ if __name__ == "__main__":
     parser.add_argument("--rollout_fps_values", type=str, default='1,4', help="")
     
     parser.add_argument("--exp", type=str, default=None, help="experiment name")
+    
+    # W&B arguments
+    parser.add_argument("--wandb-enabled", action="store_true", help="Enable W&B logging")
+    parser.add_argument("--wandb-project", type=str, default="nwm", help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity/team name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--wandb-group", type=str, default=None, help="W&B group name")
+    parser.add_argument("--wandb-tags", type=str, default=None, help="W&B tags (comma-separated)")
+    parser.add_argument("--wandb-checkpoint-epoch", type=int, default=None, help="Checkpoint epoch")
+    parser.add_argument("--wandb-checkpoint-step", type=int, default=None, help="Checkpoint training step")
+    parser.add_argument("--wandb-checkpoint-path", type=str, default=None, help="Checkpoint file path")
     
     args = parser.parse_args()
     
