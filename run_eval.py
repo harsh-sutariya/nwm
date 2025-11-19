@@ -85,11 +85,19 @@ def load_metrics(json_path):
     """Load metrics from JSON file."""
     if not os.path.exists(json_path):
         print(f"Warning: Metrics file not found: {json_path}")
+        # List files in the directory to help debug
+        dir_path = os.path.dirname(json_path)
+        if os.path.exists(dir_path):
+            print(f"  Files in directory {dir_path}:")
+            for f in os.listdir(dir_path):
+                if f.endswith('.json'):
+                    print(f"    - {f}")
         return None
     
     with open(json_path, 'r') as f:
         metrics = json.load(f)
     
+    print(f"✓ Loaded metrics from: {json_path}")
     return metrics
 
 
@@ -114,9 +122,12 @@ def log_metrics_to_wandb(wandb_run, metrics, prefix):
 def main():
     args = parse_args()
     
-    # Extract checkpoint name and config name
-    checkpoint_name = Path(args.checkpoint).stem  # e.g., 'latest' or 'checkpoint_epoch_10'
-    config_name = Path(args.config).stem  # e.g., 'ac_repa_cdit_xl'
+    # Extract checkpoint name and config name (matching isolated_nwm_infer.py logic)
+    # Config name: remove path and extension (e.g., 'ac_repa_cdit_xl' from 'config/ac_repa_cdit_xl.yaml')
+    config_name = os.path.basename(args.config).split('.')[0]
+    
+    # Checkpoint name: remove path and .pth.tar extension (e.g., 'latest' from '/path/to/latest.pth.tar')
+    checkpoint_name = os.path.basename(args.checkpoint).replace('.pth.tar', '')
     
     # Load checkpoint metadata
     print(f"Loading checkpoint metadata from: {args.checkpoint}")
@@ -151,8 +162,14 @@ def main():
         }
     )
     
-    # Determine experiment output directory
-    exp_output_dir = os.path.join(args.output_dir, f"{config_name}_{checkpoint_name}")
+    # Determine experiment output directory (matching isolated_nwm_infer.py logic)
+    # Only add checkpoint suffix if it's not the default '0100000'
+    exp_output_dir = os.path.join(args.output_dir, config_name)
+    if checkpoint_name != '0100000':
+        exp_output_dir = f"{exp_output_dir}_{checkpoint_name}"
+    
+    print(f"\nExperiment output directory: {exp_output_dir}")
+    print(f"GT directory: {os.path.join(args.output_dir, 'gt')}")
     
     datasets = args.datasets.split(',')
     success = True
@@ -190,7 +207,7 @@ def main():
         time_metrics_cmd = [
             'python', 'isolated_nwm_eval.py',
             '--datasets', dataset,
-            '--gt_dir', os.path.join(args.output_dir, 'gt', dataset, 'time'),
+            '--gt_dir', os.path.join(args.output_dir, 'gt'),
             '--exp_dir', exp_output_dir,
             '--eval_types', 'time',
         ]
@@ -231,28 +248,32 @@ def main():
         success = False
     
     # Step 2: Rollout metrics computation (WITHOUT W&B logging)
+    # Note: isolated_nwm_eval.py expects 'rollout' in eval_types and loops through rollout_fps_values internally
     rollout_fps_list = [fps.strip() for fps in args.rollout_fps_values.split(',')]
     
     for dataset in datasets:
         dataset = dataset.strip()
         
+        # Call isolated_nwm_eval.py once with 'rollout' - it will process all fps values
+        rollout_metrics_cmd = [
+            'python', 'isolated_nwm_eval.py',
+            '--datasets', dataset,
+            '--gt_dir', os.path.join(args.output_dir, 'gt'),
+            '--exp_dir', exp_output_dir,
+            '--eval_types', 'rollout',
+            '--rollout_fps_values', args.rollout_fps_values,
+        ]
+        
+        if not run_command(rollout_metrics_cmd, f"Rollout metrics computation ({dataset})"):
+            success = False
+            continue
+        
+        # Step 3: Load and log rollout metrics to W&B for each fps
         for rollout_fps in rollout_fps_list:
-            rollout_metrics_cmd = [
-                'python', 'isolated_nwm_eval.py',
-                '--datasets', dataset,
-                '--gt_dir', os.path.join(args.output_dir, 'gt', dataset, f'rollout_{rollout_fps}fps'),
-                '--exp_dir', exp_output_dir,
-                '--eval_types', f'rollout_{rollout_fps}fps',
-            ]
-            
-            if not run_command(rollout_metrics_cmd, f"Rollout metrics computation ({dataset}, {rollout_fps}fps)"):
-                success = False
-                continue
-            
-            # Step 3: Load and log rollout metrics to W&B
             rollout_metrics_path = os.path.join(exp_output_dir, f"{dataset}_rollout_{rollout_fps}fps.json")
             rollout_metrics = load_metrics(rollout_metrics_path)
-            log_metrics_to_wandb(wandb_run, rollout_metrics, f"rollout_{rollout_fps}fps/{dataset}")
+            if rollout_metrics:
+                log_metrics_to_wandb(wandb_run, rollout_metrics, f"rollout_{rollout_fps}fps/{dataset}")
     
     # =========================================================================
     # FINALIZE

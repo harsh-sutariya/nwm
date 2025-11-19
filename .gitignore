@@ -9,3 +9,4 @@ nwm/data
 data_splits/**/dataset*.pkl
 data
 wandb/
+evaluation_output/
