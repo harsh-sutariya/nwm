@@ -989,44 +989,64 @@ def init_wandb(args, config, rank, world_size, is_distributed):
         
         if rank == 0:
             # Primary node: Create new run
-            run = wandb.init(
-                project=project,
-                entity=entity,
-                name=run_name,
-                id=run_id_from_env,  # Use env var if provided, otherwise create new
-                config=wandb_config,
-                settings=wandb.Settings(
-                    mode="shared",
-                    x_primary=True,
-                    x_label=f"rank_{rank}",
-                    x_stats_gpu_device_ids=list(range(torch.cuda.device_count())),
-                ),
-                tags=["distributed", "training", fresh_tag] + tags,
-                notes=f"Distributed training with {world_size} processes{fresh_note_suffix}",
-            )
-            run_id = run.id
-            
-            # BEST PRACTICE: Store run_id in file before barrier so workers can read it
-            # Use distributed barrier for synchronization (more reliable than polling)
-            save_run_id_for_workers(run_id, config)
-            
-            print(f"W&B initialized on primary node (rank {rank}) with run ID: {run_id}")
+            try:
+                run = wandb.init(
+                    project=project,
+                    entity=entity,
+                    name=run_name,
+                    id=run_id_from_env,  # Use env var if provided, otherwise create new
+                    config=wandb_config,
+                    settings=wandb.Settings(
+                        mode="shared",
+                        x_primary=True,
+                        x_label=f"rank_{rank}",
+                        x_stats_gpu_device_ids=list(range(torch.cuda.device_count())),
+                    ),
+                    tags=["distributed", "training", fresh_tag] + tags,
+                    notes=f"Distributed training with {world_size} processes{fresh_note_suffix}",
+                )
+                run_id = run.id
+                
+                # Validate run_id is not empty
+                if not run_id or len(run_id.strip()) == 0:
+                    raise ValueError(f"W&B returned empty run_id on rank {rank}")
+                
+                print(f"W&B initialized on primary node (rank {rank}) with run ID: {run_id}")
+            except Exception as e:
+                print(f"ERROR: W&B initialization failed on rank {rank}: {e}")
+                print(f"Continuing without W&B logging on rank {rank}")
+                run_id = None
+                run = None
         
-        # BEST PRACTICE: Use distributed barrier for synchronization
-        # Barrier ensures all processes wait for rank 0 to finish W&B init and create run_id file
-        dist.barrier()
+        # BEST PRACTICE: Use distributed broadcast to share run_id (more reliable than file)
+        # Convert run_id to tensor for broadcasting (use CPU tensor for simplicity)
+        max_len = 64  # wandb run IDs are typically short, use 64 chars max
+        if rank == 0:
+            # Encode run_id as bytes, then convert to tensor
+            # If run_id is None (W&B init failed), use empty string
+            run_id_str = run_id if run_id else ''
+            run_id_bytes = run_id_str.encode('utf-8')
+            # Pad to fixed size
+            run_id_bytes = run_id_bytes[:max_len].ljust(max_len, b'\0')
+            run_id_tensor = torch.tensor(list(run_id_bytes), dtype=torch.uint8)
+        else:
+            run_id_tensor = torch.zeros(max_len, dtype=torch.uint8)
         
-        if rank != 0:
-            # Worker nodes: Read run_id from file (created by rank 0 before barrier)
-            # After barrier, file is guaranteed to exist
-            run_id_file = f"/tmp/wandb_run_id_{config['run_name']}.txt"
-            
-            if os.path.exists(run_id_file):
-                with open(run_id_file, 'r') as f:
-                    run_id = f.read().strip()
+        # Broadcast run_id from rank 0 to all ranks (CPU tensor)
+        dist.broadcast(run_id_tensor, src=0)
+        
+        # Decode run_id on all ranks
+        run_id_bytes = bytes(run_id_tensor.numpy()).rstrip(b'\0')
+        run_id = run_id_bytes.decode('utf-8') if len(run_id_bytes) > 0 else None
+        
+        # Validate run_id
+        if not run_id or len(run_id.strip()) == 0:
+            if rank == 0:
+                # Rank 0 already failed, return None
+                return None, None
             else:
-                # Fallback: This shouldn't happen after barrier, but handle gracefully
-                print(f"Error: run_id file not found after barrier (rank {rank})")
+                print(f"ERROR: Invalid run_id received on rank {rank} after broadcast (rank 0 W&B init failed)")
+                print(f"Continuing without W&B logging on rank {rank}")
                 return None, None
         
         # All workers (including rank 0) now have run_id
@@ -1034,19 +1054,24 @@ def init_wandb(args, config, rank, world_size, is_distributed):
             return run, run_id
         else:
             # Worker nodes: Join existing run
-            run = wandb.init(
-                project=project,
-                entity=entity,
-                id=run_id,
-                settings=wandb.Settings(
-                    mode="shared",
-                    x_primary=False,
-                    x_label=f"rank_{rank}",
-                    x_update_finish_state=False,
-                ),
-            )
-            print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
-            return run, run_id
+            try:
+                run = wandb.init(
+                    project=project,
+                    entity=entity,
+                    id=run_id,
+                    settings=wandb.Settings(
+                        mode="shared",
+                        x_primary=False,
+                        x_label=f"rank_{rank}",
+                        x_update_finish_state=False,
+                    ),
+                )
+                print(f"W&B initialized on worker node (rank {rank}) with shared run ID: {run_id}")
+                return run, run_id
+            except Exception as e:
+                print(f"ERROR: W&B initialization failed on worker rank {rank}: {e}")
+                print(f"Continuing without W&B logging on rank {rank}")
+                return None, None
     else:
         # Single GPU training: Standard initialization
         base_run_name = args.wandb_run_name or config.get('wandb_run_name') or f"{config['run_name']}_single_gpu"
