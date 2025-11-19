@@ -1019,8 +1019,11 @@ def init_wandb(args, config, rank, world_size, is_distributed):
                 run = None
         
         # BEST PRACTICE: Use distributed broadcast to share run_id (more reliable than file)
-        # Convert run_id to tensor for broadcasting (use CPU tensor for simplicity)
+        # Convert run_id to tensor for broadcasting (NCCL requires CUDA tensors)
         max_len = 64  # wandb run IDs are typically short, use 64 chars max
+        # Get current CUDA device (set by init_distributed)
+        cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        
         if rank == 0:
             # Encode run_id as bytes, then convert to tensor
             # If run_id is None (W&B init failed), use empty string
@@ -1028,15 +1031,23 @@ def init_wandb(args, config, rank, world_size, is_distributed):
             run_id_bytes = run_id_str.encode('utf-8')
             # Pad to fixed size
             run_id_bytes = run_id_bytes[:max_len].ljust(max_len, b'\0')
-            run_id_tensor = torch.tensor(list(run_id_bytes), dtype=torch.uint8)
+            if cuda_device is not None:
+                run_id_tensor = torch.tensor(list(run_id_bytes), dtype=torch.uint8, device=f'cuda:{cuda_device}')
+            else:
+                # Fallback to CPU if CUDA not available (shouldn't happen in distributed training)
+                run_id_tensor = torch.tensor(list(run_id_bytes), dtype=torch.uint8)
         else:
-            run_id_tensor = torch.zeros(max_len, dtype=torch.uint8)
+            if cuda_device is not None:
+                run_id_tensor = torch.zeros(max_len, dtype=torch.uint8, device=f'cuda:{cuda_device}')
+            else:
+                run_id_tensor = torch.zeros(max_len, dtype=torch.uint8)
         
-        # Broadcast run_id from rank 0 to all ranks (CPU tensor)
+        # Broadcast run_id from rank 0 to all ranks (CUDA tensor for NCCL)
         dist.broadcast(run_id_tensor, src=0)
         
-        # Decode run_id on all ranks
-        run_id_bytes = bytes(run_id_tensor.numpy()).rstrip(b'\0')
+        # Decode run_id on all ranks (move to CPU for numpy conversion)
+        run_id_tensor_cpu = run_id_tensor.cpu()
+        run_id_bytes = bytes(run_id_tensor_cpu.numpy()).rstrip(b'\0')
         run_id = run_id_bytes.decode('utf-8') if len(run_id_bytes) > 0 else None
         
         # Validate run_id
