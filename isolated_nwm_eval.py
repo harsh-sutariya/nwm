@@ -12,6 +12,7 @@ import numpy as np
 import json
 
 from PIL import Image
+import cv2
 
 # Eval
 import lpips
@@ -75,6 +76,173 @@ def get_loss_fn(loss_fn_type, secs, device):
         raise NotImplementedError
     
     return loss_fn
+
+
+#################################################################################
+#                    Temporal Artifact Metrics                                  #
+#################################################################################
+
+def compute_optical_flow(img1, img2):
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY)
+    
+    flow = cv2.calcOpticalFlowFarneback(
+        gray1, gray2,
+        None,  # flow (output)
+        0.5,   # pyr_scale: pyramid scale factor
+        3,     # levels: number of pyramid levels
+        15,    # winsize: averaging window size
+        3,     # iterations: number of iterations at each pyramid level
+        5,     # poly_n: size of pixel neighborhood
+        1.2,   # poly_sigma: standard deviation of Gaussian
+        0     # flags
+    )
+    
+    flow_magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+    
+    return flow, flow_magnitude
+
+
+def compute_temporal_smoothness(frame_paths, lpips_loss_fn):
+    if len(frame_paths) < 2:
+        return 0.0, 0.0
+    
+    lpips_distances = []
+    for i in range(len(frame_paths) - 1):
+        lpips_dist = lpips_loss_fn([frame_paths[i]], [frame_paths[i+1]])
+        lpips_distances.append(lpips_dist.item())
+    
+    lpips_distances = np.array(lpips_distances)
+    lpips_variance = np.var(lpips_distances)
+    lpips_mean = np.mean(lpips_distances)
+    
+    return lpips_variance, lpips_mean
+
+
+def compute_jerk_metric(flow_magnitudes):
+    if len(flow_magnitudes) < 3:
+        return 0.0, 0.0
+    
+    velocities = []
+    for i in range(len(flow_magnitudes) - 1):
+        velocity = flow_magnitudes[i+1] - flow_magnitudes[i]
+        velocities.append(velocity)
+    
+    if len(velocities) < 2:
+        return 0.0, 0.0
+    
+    accelerations = []
+    for i in range(len(velocities) - 1):
+        acceleration = velocities[i+1] - velocities[i]
+        accelerations.append(acceleration)
+    
+    if len(accelerations) < 2:
+        return 0.0, 0.0
+    
+    jerks = []
+    for i in range(len(accelerations) - 1):
+        jerk = accelerations[i+1] - accelerations[i]
+        jerk_magnitude = np.abs(jerk)
+        jerks.append(jerk_magnitude)
+    
+    if len(jerks) == 0:
+        return 0.0, 0.0
+    
+    all_jerks = np.concatenate([j.flatten() for j in jerks])
+    mean_jerk = np.mean(all_jerks)
+    max_jerk = np.max(all_jerks)
+    
+    return mean_jerk, max_jerk
+
+
+def evaluate_temporal_artifacts(args, dataset_name, eval_type, metric_logger, lpips_loss_fn, gt_dir, exp_dir, secs, rollout_fps):
+    if eval_type == 'rollout':
+        eval_name = f'rollout_{rollout_fps}fps'
+        # For rollout, we evaluate sequences of frames
+        max_frame_idx = int((secs[-1] * rollout_fps) - 1)
+    elif eval_type == 'time':
+        eval_name = 'time'
+        # For time eval, we compare initial frame with predicted frames at different time steps
+        max_frame_idx = int(secs[-1])
+    else:
+        return
+    
+    eps = os.listdir(gt_dir)
+    
+    for batch_start in tqdm(range(0, len(eps), args.batch_size), 
+                           total=(len(eps) + args.batch_size - 1) // args.batch_size,
+                           desc=f"Temporal artifacts ({eval_name})"):
+        batch_eps = eps[batch_start:batch_start + args.batch_size]
+        
+        for ep in batch_eps:
+            gt_ep_dir = os.path.join(gt_dir, ep)
+            exp_ep_dir = os.path.join(exp_dir, ep)
+            
+            if not os.path.isdir(gt_ep_dir) or not os.path.isdir(exp_ep_dir):
+                continue
+            
+            gt_frame_paths = []
+            exp_frame_paths = []
+            
+            for frame_idx in range(max_frame_idx + 1):
+                gt_frame_path = os.path.join(gt_ep_dir, f'{frame_idx}.png')
+                exp_frame_path = os.path.join(exp_ep_dir, f'{frame_idx}.png')
+                
+                if os.path.exists(gt_frame_path) and os.path.exists(exp_frame_path):
+                    gt_frame_paths.append(gt_frame_path)
+                    exp_frame_paths.append(exp_frame_path)
+            
+            if len(gt_frame_paths) < 2:
+                continue
+            
+            # 1. Optical Flow Consistency
+            gt_flows = []
+            exp_flows = []
+            gt_flow_magnitudes = []
+            exp_flow_magnitudes = []
+            
+            for i in range(len(gt_frame_paths) - 1):
+                gt_img1 = np.array(Image.open(gt_frame_paths[i]).convert("RGB"))
+                gt_img2 = np.array(Image.open(gt_frame_paths[i+1]).convert("RGB"))
+                exp_img1 = np.array(Image.open(exp_frame_paths[i]).convert("RGB"))
+                exp_img2 = np.array(Image.open(exp_frame_paths[i+1]).convert("RGB"))
+                
+                gt_flow, gt_flow_mag = compute_optical_flow(gt_img1, gt_img2)
+                exp_flow, exp_flow_mag = compute_optical_flow(exp_img1, exp_img2)
+                
+                gt_flows.append(gt_flow)
+                exp_flows.append(exp_flow)
+                gt_flow_magnitudes.append(gt_flow_mag)
+                exp_flow_magnitudes.append(exp_flow_mag)
+            
+            # Compute flow consistency (L2 distance between GT and predicted flows)
+            if len(gt_flows) > 0:
+                flow_errors = []
+                for gt_flow, exp_flow in zip(gt_flows, exp_flows):
+                    flow_error = np.mean(np.sqrt(np.sum((gt_flow - exp_flow)**2, axis=2)))
+                    flow_errors.append(flow_error)
+                
+                mean_flow_error = np.mean(flow_errors)
+                metric_logger.meters[f'{dataset_name}_{eval_name}_flow_error'].update(mean_flow_error, n=1)
+            
+            # 2. Temporal Smoothness (LPIPS variance)
+            gt_lpips_var, gt_lpips_mean = compute_temporal_smoothness(gt_frame_paths, lpips_loss_fn)
+            exp_lpips_var, exp_lpips_mean = compute_temporal_smoothness(exp_frame_paths, lpips_loss_fn)
+            
+            metric_logger.meters[f'{dataset_name}_{eval_name}_temporal_smoothness_var'].update(exp_lpips_var, n=1)
+            metric_logger.meters[f'{dataset_name}_{eval_name}_temporal_smoothness_mean'].update(exp_lpips_mean, n=1)
+            metric_logger.meters[f'{dataset_name}_{eval_name}_temporal_smoothness_var_gt'].update(gt_lpips_var, n=1)
+            metric_logger.meters[f'{dataset_name}_{eval_name}_temporal_smoothness_mean_gt'].update(gt_lpips_mean, n=1)
+            
+            # 3. Jerk Metric (acceleration discontinuities)
+            if len(gt_flow_magnitudes) >= 3:
+                gt_mean_jerk, gt_max_jerk = compute_jerk_metric(gt_flow_magnitudes)
+                exp_mean_jerk, exp_max_jerk = compute_jerk_metric(exp_flow_magnitudes)
+                
+                metric_logger.meters[f'{dataset_name}_{eval_name}_jerk_mean'].update(exp_mean_jerk, n=1)
+                metric_logger.meters[f'{dataset_name}_{eval_name}_jerk_max'].update(exp_max_jerk, n=1)
+                metric_logger.meters[f'{dataset_name}_{eval_name}_jerk_mean_gt'].update(gt_mean_jerk, n=1)
+                metric_logger.meters[f'{dataset_name}_{eval_name}_jerk_max_gt'].update(gt_max_jerk, n=1)
 
 
 def evaluate(args, dataset_name, eval_type, metric_logger, loss_fns, gt_dir, exp_dir, secs, rollout_fps):
@@ -211,6 +379,8 @@ def main(args):
                     rollout_loss_fns = (lpips_loss_fn, dreamsim_loss_fn, rollout_fid_loss_fn)
                     with torch.no_grad():
                         evaluate(args, dataset_name, 'rollout', metric_logger, rollout_loss_fns, gt_dataset_rollout_dir, exp_dataset_rollout_dir, secs, rollout_fps)
+                        # Evaluate temporal artifacts for rollout
+                        evaluate_temporal_artifacts(args, dataset_name, 'rollout', metric_logger, lpips_loss_fn, gt_dataset_rollout_dir, exp_dataset_rollout_dir, secs, rollout_fps)
                     output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                     save_metric_to_disk(metric_logger, output_fn)
                     
@@ -234,6 +404,8 @@ def main(args):
                 time_loss_fns = (lpips_loss_fn, dreamsim_loss_fn, time_fid_loss_fn)
                 with torch.no_grad():
                     evaluate(args, dataset_name, eval_name, metric_logger, time_loss_fns, gt_dataset_time_dir, exp_dataset_time_dir, secs, None)
+                    # Evaluate temporal artifacts for time evaluation
+                    evaluate_temporal_artifacts(args, dataset_name, 'time', metric_logger, lpips_loss_fn, gt_dataset_time_dir, exp_dataset_time_dir, secs, None)
                 output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                 save_metric_to_disk(metric_logger, output_fn)
                 
