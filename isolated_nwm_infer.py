@@ -96,6 +96,7 @@ def generate_rollout(args, output_dir, rollout_fps, idxs, all_models, obs_image,
     
     for i in range(gt_image.shape[1]):
         curr_delta = delta[:, i:i+1].to(device)
+        
         if args.gt:
             x_pred_pixels = gt_image[:, i].clone().to(device)
         else:
@@ -104,16 +105,46 @@ def generate_rollout(args, output_dir, rollout_fps, idxs, all_models, obs_image,
         curr_obs = torch.cat((curr_obs, x_pred_pixels.unsqueeze(1)), dim=1) # append current prediction
         curr_obs = curr_obs[:, 1:] # remove first observation
         visualize_preds(output_dir, idxs, i, x_pred_pixels)
+    
+    # Save actions for each sample in batch (after all predictions are made)
+    if not args.gt:  # Only save actions for model predictions, not GT
+        delta_np = delta.cpu().numpy()  # [B, T, action_dim]
+        for batch_idx, sample_idx in enumerate(idxs.squeeze()):
+            sample_idx = int(sample_idx.item())
+            sample_folder = os.path.join(output_dir, f'id_{sample_idx}')
+            os.makedirs(sample_folder, exist_ok=True)
+            action_file = os.path.join(sample_folder, 'actions.npy')
+            # Save actions for this sample: [T, action_dim]
+            np.save(action_file, delta_np[batch_idx])
 
 def generate_time(args, output_dir, idxs, all_models, obs_image, gt_output, delta, secs, num_cond, device):
     eval_timesteps = [sec*args.input_fps for sec in secs]
+    
+    # Collect actions for each timestep
+    actions_per_timestep = []
+    
     for sec, timestep in zip(secs, eval_timesteps):
-        curr_delta = delta[:, :timestep].sum(dim=1, keepdim=True)
+        curr_delta = delta[:, :timestep].sum(dim=1, keepdim=True)  # [B, 1, action_dim]
+        actions_per_timestep.append(curr_delta.cpu().numpy())
+        
         if args.gt:
             x_pred_pixels = gt_output[:, timestep-1].clone().to(device)
         else:
             x_pred_pixels = model_forward_wrapper(all_models, obs_image, curr_delta, timestep, args.latent_size, num_cond=num_cond, num_goals=1, device=device)
         visualize_preds(output_dir, idxs, sec, x_pred_pixels)
+    
+    # Save actions for each sample in batch (after all predictions are made)
+    if not args.gt and len(actions_per_timestep) > 0:  # Only save actions for model predictions, not GT
+        # Stack actions: list of [B, 1, action_dim] -> [B, T, action_dim]
+        actions_array = np.concatenate(actions_per_timestep, axis=1)  # [B, T, action_dim]
+        
+        for batch_idx, sample_idx in enumerate(idxs.squeeze()):
+            sample_idx = int(sample_idx.item())
+            sample_folder = os.path.join(output_dir, f'id_{sample_idx}')
+            os.makedirs(sample_folder, exist_ok=True)
+            action_file = os.path.join(sample_folder, 'actions.npy')
+            # Save actions for this sample: [T, action_dim]
+            np.save(action_file, actions_array[batch_idx])
 
 def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
     for batch_idx, sample_idx in enumerate(idxs.squeeze()):

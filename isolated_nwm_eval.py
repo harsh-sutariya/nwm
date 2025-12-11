@@ -24,6 +24,9 @@ import distributed as dist
 # W&B
 import wandb
 
+# Action insensitivity metrics
+from action_insensitivity_metrics import evaluate_action_insensitivity_from_predictions
+
 
 def get_loss_fn(loss_fn_type, secs, device):
     if loss_fn_type == 'lpips':
@@ -381,6 +384,19 @@ def main(args):
                         evaluate(args, dataset_name, 'rollout', metric_logger, rollout_loss_fns, gt_dataset_rollout_dir, exp_dataset_rollout_dir, secs, rollout_fps)
                         # Evaluate temporal artifacts for rollout
                         evaluate_temporal_artifacts(args, dataset_name, 'rollout', metric_logger, lpips_loss_fn, gt_dataset_rollout_dir, exp_dataset_rollout_dir, secs, rollout_fps)
+                        # Evaluate action insensitivity for rollout
+                        evaluate_action_insensitivity_from_predictions(
+                            gt_dir=gt_dataset_rollout_dir,
+                            exp_dir=exp_dataset_rollout_dir,
+                            dataset_name=dataset_name,
+                            eval_type='rollout',
+                            metric_logger=metric_logger,
+                            lpips_loss_fn=lpips_loss_fn,
+                            dreamsim_loss_fn=dreamsim_loss_fn,
+                            secs=secs,
+                            rollout_fps=rollout_fps,
+                            device=device
+                        )
                     output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                     save_metric_to_disk(metric_logger, output_fn)
                     
@@ -406,6 +422,19 @@ def main(args):
                     evaluate(args, dataset_name, eval_name, metric_logger, time_loss_fns, gt_dataset_time_dir, exp_dataset_time_dir, secs, None)
                     # Evaluate temporal artifacts for time evaluation
                     evaluate_temporal_artifacts(args, dataset_name, 'time', metric_logger, lpips_loss_fn, gt_dataset_time_dir, exp_dataset_time_dir, secs, None)
+                    # Evaluate action insensitivity for time evaluation
+                    evaluate_action_insensitivity_from_predictions(
+                        gt_dir=gt_dataset_time_dir,
+                        exp_dir=exp_dataset_time_dir,
+                        dataset_name=dataset_name,
+                        eval_type='time',
+                        metric_logger=metric_logger,
+                        lpips_loss_fn=lpips_loss_fn,
+                        dreamsim_loss_fn=dreamsim_loss_fn,
+                        secs=secs,
+                        rollout_fps=None,
+                        device=device
+                    )
                 output_fn = os.path.join(args.exp_dir, f'{dataset_name}_{eval_name}.json')
                 save_metric_to_disk(metric_logger, output_fn)
                 
