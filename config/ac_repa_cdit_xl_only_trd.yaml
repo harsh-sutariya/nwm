@@ -1,0 +1,70 @@
+run_name: ac_repa_cdit_sl_only_trd
+
+wandb_project: "nwm"
+wandb_run_name: null 
+
+# Resume behavior: set to true to allow resuming from checkpoints and wandb runs
+# Default: false (always start fresh training)
+# allow_resume: false
+
+# Quick debug mode: runs only a few steps (3) through all processes for testing
+# Default: false (full training)
+quick_debug: false
+
+# training setup
+results_dir: logs
+train: True
+batch_size: 16
+num_workers: 12
+model: CDiT-S/2
+lr: 8e-5
+
+# normalization for the action space
+normalize: True
+grad_clip_val: 10.0
+context_size: 4
+
+# distance bounds for distance and action and distance predictions 
+distance:
+  min_dist_cat: -64
+  max_dist_cat: 64
+
+# action output params
+len_traj_pred: 64
+
+# AC-REPA training objective parameters
+use_ac_repa: True
+ac_repa:
+  teacher_model: 'MCG-NJU/videomae-base-finetuned-kinetics' 
+  teacher_dim: 768   # VideoMAE base hidden dimension
+  proj_dim: 512
+  fa_pool_type: 'mean'
+  trd_gate_type: 'action'
+  lambda_fa: 0.0     # Feature Alignment weight
+  lambda_trd: 0.05   # Temporal Relation Distillation weight
+  use_sparse_trd: True
+  sparse_ratio: 0.25
+
+# dataset specific parameters
+image_size: 224
+datasets:
+  recon:
+    data_folder: /vast/hs5580/data/nwm/vast/hs5580/data/nwm/recon
+    train: data_splits/recon/train/ # path to train folder with traj_names.txt
+    test: data_splits/recon/test/ # path to test folder with traj_names.txt
+    goals_per_obs: 4
+  # tartan_drive:
+  #   data_folder: data/tartan
+  #   train: data_splits/tartan_drive/train/
+  #   test: data_splits/tartan_drive/test/
+  #   goals_per_obs: 4
+  # sacson:
+  #   data_folder: data/sacson
+  #   train: data_splits/sacson/train
+  #   test: data_splits/sacson/test
+  #   goals_per_obs: 4
+  # scand:
+  #   data_folder: data/scand
+  #   train: data_splits/scand/train
+  #   test: data_splits/scand/test
+  #   goals_per_obs: 4
